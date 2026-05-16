@@ -19,6 +19,8 @@ const GITHUB_ISSUES_PAGE_SIZE = 100;
 const GITHUB_DELTA_BUFFER_MS = 60_000;
 const GRANOLA_PAGE_SIZE = 30;
 const GRANOLA_DELTA_BUFFER_MS = 60_000;
+const GRANOLA_NOTION_DATA_SOURCE_ID_DEFAULT =
+	"3623edae-28d3-8095-958c-000b712611af";
 
 const githubApi = worker.pacer("githubApi", {
 	allowedRequests: 10,
@@ -380,11 +382,18 @@ worker.sync("sentryIssuesSync", {
 	database: sentryIssues,
 	mode: "replace",
 	schedule: "30m",
-	execute: async (state: SentrySyncState | undefined) => {
+	execute: async (state: SentrySyncState | undefined, { notion }) => {
 		const token = requireEnv("SENTRY_AUTH_TOKEN");
 		const orgSlug = requireAnyEnv("SENTRY_ORG_SLUG", "SENTRY_ORG");
 		const allowedProjects = parseCsv(
 			process.env.SENTRY_PROJECT_SLUGS ?? process.env.SENTRY_PROJECT,
+		);
+		const auth = requireAnyEnv("SENTRY_NOTION_API_TOKEN", "NOTION_API_TOKEN");
+		const notionClient = notion as unknown as NotionClientLike;
+		const dataSourceId = await resolveDataSourceId(
+			notionClient,
+			auth,
+			requireAnyEnv("SENTRY_NOTION_DATABASE_ID", "NOTION_SENTRY_DATABASE_ID"),
 		);
 		const url = new URL(
 			`https://sentry.io/api/0/organizations/${encodeURIComponent(orgSlug)}/issues/`,
@@ -416,28 +425,12 @@ worker.sync("sentryIssuesSync", {
 					)
 				: issues;
 
+		for (const issue of filteredIssues) {
+			await upsertSentryIssuePage(notionClient, auth, dataSourceId, issue);
+		}
+
 		return {
-			changes: filteredIssues.map((issue) => ({
-				type: "upsert" as const,
-				key: issue.id,
-				properties: {
-					Issue: Builder.title(issue.title ?? `Sentry issue ${issue.id}`),
-					"Sentry Issue ID": Builder.richText(issue.id),
-					Culprit: Builder.richText(issue.culprit ?? ""),
-					Level: Builder.richText(issue.level ?? ""),
-					Status: Builder.richText(issue.status ?? ""),
-					Project: Builder.richText(
-						issue.project?.slug ?? issue.project?.name ?? "",
-					),
-					"User Count": Builder.number(toNumber(issue.userCount)),
-					"Event Count": Builder.number(toNumber(issue.count)),
-					"First Seen": dateTimeOrEmpty(issue.firstSeen),
-					"Last Seen": dateTimeOrEmpty(issue.lastSeen),
-					Permalink: urlOrEmpty(issue.permalink),
-				},
-				upstreamUpdatedAt: issue.lastSeen,
-				pageContentMarkdown: sentryIssueMarkdown(issue),
-			})),
+			changes: [],
 			hasMore: nextCursor !== undefined,
 			nextState: nextCursor ? { cursor: nextCursor } : undefined,
 		};
@@ -601,13 +594,16 @@ type NotionClientLike = {
 		retrieve: (args: Record<string, unknown>) => Promise<unknown>;
 	};
 	dataSources: {
+		retrieve: (args: Record<string, unknown>) => Promise<unknown>;
 		query: (args: Record<string, unknown>) => Promise<{
 			results: Array<{ id: string; object: string }>;
 		}>;
+		update: (args: Record<string, unknown>) => Promise<unknown>;
 	};
 	pages: {
 		create: (args: Record<string, unknown>) => Promise<unknown>;
 		update: (args: Record<string, unknown>) => Promise<unknown>;
+		updateMarkdown: (args: Record<string, unknown>) => Promise<unknown>;
 	};
 };
 
@@ -867,14 +863,23 @@ worker.sync("granolaNotesBackfill", {
 	database: granolaNotes,
 	mode: "replace",
 	schedule: "manual",
-	execute: async (state: GranolaBackfillState | undefined) => {
+	execute: async (state: GranolaBackfillState | undefined, { notion }) => {
 		const token = requireEnv("GRANOLA_API_KEY");
 		const includeTranscript = process.env.GRANOLA_INCLUDE_TRANSCRIPT === "true";
+		const notionClient = notion as unknown as NotionClientLike;
+		const dataSourceId = await resolveDataSourceId(
+			notionClient,
+			requireEnv("NOTION_API_TOKEN"),
+			granolaNotionTargetId(),
+		);
+		const schema = await ensureGranolaNotionSchema(notionClient, dataSourceId);
 
 		const page = await fetchGranolaNotesPage(token, { cursor: state?.cursor });
 		const notes = await fetchGranolaNotes(page.notes, token, includeTranscript);
+		await upsertGranolaNotePages(notionClient, dataSourceId, notes, schema);
+
 		return {
-			changes: notes.map(granolaNoteChange),
+			changes: [],
 			hasMore: page.hasMore,
 			nextState:
 				page.hasMore && page.cursor ? { cursor: page.cursor } : undefined,
@@ -886,11 +891,18 @@ worker.sync("granolaNotesDelta", {
 	database: granolaNotes,
 	mode: "incremental",
 	schedule: "5m",
-	execute: async (state: GranolaDeltaState | undefined) => {
+	execute: async (state: GranolaDeltaState | undefined, { notion }) => {
 		const token = requireEnv("GRANOLA_API_KEY");
 		const includeTranscript = process.env.GRANOLA_INCLUDE_TRANSCRIPT === "true";
 		const updatedAfter =
 			state?.updatedAfter ?? bufferedGranolaDeltaCursor(new Date());
+		const notionClient = notion as unknown as NotionClientLike;
+		const dataSourceId = await resolveDataSourceId(
+			notionClient,
+			requireEnv("NOTION_API_TOKEN"),
+			granolaNotionTargetId(),
+		);
+		const schema = await ensureGranolaNotionSchema(notionClient, dataSourceId);
 
 		const page = await fetchGranolaNotesPage(token, {
 			updatedAfter,
@@ -901,9 +913,10 @@ worker.sync("granolaNotesDelta", {
 			state?.cycleMaxUpdatedAt,
 			...notes.map((note) => note.updated_at),
 		);
+		await upsertGranolaNotePages(notionClient, dataSourceId, notes, schema);
 
 		return {
-			changes: notes.map(granolaNoteChange),
+			changes: [],
 			hasMore: page.hasMore,
 			nextState:
 				page.hasMore && page.cursor
@@ -985,6 +998,142 @@ async function fetchGranolaNote(
 		},
 		`Granola note ${noteId}`,
 	);
+}
+
+type GranolaNotionSchema = {
+	titleProperty: string;
+};
+
+function granolaNotionTargetId(): string {
+	return (
+		process.env.GRANOLA_NOTION_DATA_SOURCE_ID ??
+		process.env.GRANOLA_NOTION_DATABASE_ID ??
+		GRANOLA_NOTION_DATA_SOURCE_ID_DEFAULT
+	);
+}
+
+async function ensureGranolaNotionSchema(
+	notion: NotionClientLike,
+	dataSourceId: string,
+): Promise<GranolaNotionSchema> {
+	const dataSource = await notion.dataSources.retrieve({
+		data_source_id: dataSourceId,
+	});
+	const properties = objectValue(objectValue(dataSource)?.properties) ?? {};
+	const titleProperty =
+		Object.entries(properties).find(
+			([, property]) => objectValue(property)?.type === "title",
+		)?.[0] ?? "Note";
+	const missingProperties: Record<string, unknown> = {};
+
+	for (const [name, config] of Object.entries({
+		"Granola Note ID": { rich_text: {} },
+		Owner: { rich_text: {} },
+		Attendees: { rich_text: {} },
+		"Meeting Time": { date: {} },
+		Summary: { rich_text: {} },
+		"Action Items": { rich_text: {} },
+		"Updated Time": { date: {} },
+		"Web URL": { url: {} },
+	})) {
+		if (!properties[name]) {
+			missingProperties[name] = config;
+		}
+	}
+
+	if (Object.keys(missingProperties).length > 0) {
+		await notion.dataSources.update({
+			data_source_id: dataSourceId,
+			properties: missingProperties,
+		});
+	}
+
+	return { titleProperty };
+}
+
+async function upsertGranolaNotePages(
+	notion: NotionClientLike,
+	dataSourceId: string,
+	notes: GranolaNote[],
+	schema: GranolaNotionSchema,
+): Promise<void> {
+	for (const note of notes) {
+		await upsertGranolaNotePage(notion, dataSourceId, note, schema);
+	}
+}
+
+async function upsertGranolaNotePage(
+	notion: NotionClientLike,
+	dataSourceId: string,
+	note: GranolaNote,
+	schema: GranolaNotionSchema,
+): Promise<void> {
+	const { properties, markdown } = toNotionGranolaPage(note, schema);
+	const existing = await notion.dataSources.query({
+		data_source_id: dataSourceId,
+		page_size: 1,
+		result_type: "page",
+		filter: {
+			property: "Granola Note ID",
+			rich_text: {
+				equals: note.id,
+			},
+		},
+	});
+	const page = existing.results.find((result) => result.object === "page");
+
+	if (page) {
+		await notion.pages.update({
+			page_id: page.id,
+			properties,
+		});
+		await notion.pages.updateMarkdown({
+			page_id: page.id,
+			type: "replace_content",
+			replace_content: {
+				new_str: markdown,
+				allow_deleting_content: true,
+			},
+		});
+		return;
+	}
+
+	await notion.pages.create({
+		parent: {
+			type: "data_source_id",
+			data_source_id: dataSourceId,
+		},
+		properties,
+		markdown,
+	});
+}
+
+function toNotionGranolaPage(
+	note: GranolaNote,
+	schema: GranolaNotionSchema,
+): { properties: Record<string, unknown>; markdown: string } {
+	const summary = note.summary_markdown ?? note.summary_text ?? "";
+	const actionItems = extractActionItems(summary);
+	const attendees = formatPeople(note.attendees ?? note.calendar_event?.invitees);
+	const meetingTime =
+		note.calendar_event?.scheduled_start_time ?? note.created_at;
+
+	return {
+		properties: {
+			[schema.titleProperty]: notionTitle(
+				note.title ?? `Granola note ${note.id}`,
+			),
+			"Granola Note ID": notionRichText(note.id),
+			Owner: notionRichText(formatPerson(note.owner)),
+			Attendees: notionRichText(attendees),
+			"Meeting Time": notionDate(meetingTime),
+			Summary: notionRichText(summary),
+			"Action Items": notionRichText(actionItems),
+			"Updated Time": notionDate(note.updated_at),
+			"Web URL": notionUrl(note.web_url ?? undefined),
+		},
+		markdown: granolaNoteMarkdown(note, actionItems),
+	};
 }
 
 function granolaNoteChange(note: GranolaNote) {
@@ -1073,7 +1222,15 @@ function requireAnyEnv(primaryName: string, fallbackName: string): string {
 }
 
 function normalizeNotionId(idOrUrl: string): string {
-	return idOrUrl.replace(/^collection:\/\//, "");
+	const withoutCollection = idOrUrl.replace(/^collection:\/\//, "");
+	const compactIdMatch = /([0-9a-f]{32})/i.exec(
+		withoutCollection.replace(/-/g, ""),
+	);
+	if (!compactIdMatch) {
+		return withoutCollection;
+	}
+
+	return compactIdMatch[1];
 }
 
 function parseCsv(value: string | undefined): string[] {
