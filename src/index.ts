@@ -1,6 +1,12 @@
-import { Worker, RateLimitError } from "@notionhq/workers";
+import crypto from "node:crypto";
+import {
+	Worker,
+	RateLimitError,
+	WebhookVerificationError,
+} from "@notionhq/workers";
 import * as Builder from "@notionhq/workers/builder";
 import * as Schema from "@notionhq/workers/schema";
+import { j } from "@notionhq/workers/schema-builder";
 import type { TextValue } from "@notionhq/workers/types";
 
 const worker = new Worker();
@@ -9,7 +15,10 @@ export default worker;
 const GITHUB_OWNER_DEFAULT = "modusopsai";
 const GITHUB_REPO_DEFAULT = "notion-hackathon";
 const GITHUB_EVENTS_PAGE_SIZE = 100;
+const GITHUB_ISSUES_PAGE_SIZE = 100;
+const GITHUB_DELTA_BUFFER_MS = 60_000;
 const GRANOLA_PAGE_SIZE = 30;
+const GRANOLA_DELTA_BUFFER_MS = 60_000;
 
 const githubApi = worker.pacer("githubApi", {
 	allowedRequests: 10,
@@ -42,6 +51,33 @@ const githubActivity = worker.database("githubActivity", {
 			"Created Time": Schema.date(),
 			URL: Schema.url(),
 			"Raw JSON": Schema.richText(),
+		},
+	},
+});
+
+const githubIssues = worker.database("githubIssues", {
+	type: "managed",
+	initialTitle: "GitHub Issues and PRs",
+	primaryKeyProperty: "GitHub Item ID",
+	schema: {
+		properties: {
+			Title: Schema.title(),
+			"GitHub Item ID": Schema.richText(),
+			Number: Schema.number("number"),
+			Type: Schema.richText(),
+			State: Schema.richText(),
+			"State Reason": Schema.richText(),
+			Author: Schema.richText(),
+			Assignees: Schema.richText(),
+			Labels: Schema.richText(),
+			Milestone: Schema.richText(),
+			Comments: Schema.number("number"),
+			Locked: Schema.checkbox(),
+			"Created Time": Schema.date(),
+			"Updated Time": Schema.date(),
+			"Closed Time": Schema.date(),
+			URL: Schema.url(),
+			"Repo Full Name": Schema.richText(),
 		},
 	},
 });
@@ -86,16 +122,48 @@ const granolaNotes = worker.database("granolaNotes", {
 	},
 });
 
+worker.tool("checkNotionConnection", {
+	title: "Check Notion Connection",
+	description: "Verify that NOTION_API_TOKEN can authenticate with the Notion API",
+	schema: j.object({}),
+	execute: async (_input, { notion }) => {
+		const token = requireEnv("NOTION_API_TOKEN");
+		const search = await notion.search({ auth: token, page_size: 1 });
+
+		return {
+			ok: true,
+			visibleResults: search.results.length,
+			hasMore: search.has_more,
+		};
+	},
+});
+
 type GithubSyncState = {
 	seenEventIds?: string[];
+};
+
+type GithubIssuesBackfillState = {
+	page?: number;
+};
+
+type GithubIssuesDeltaState = {
+	updatedSince?: string;
+	page?: number;
+	cycleMaxUpdatedAt?: string;
 };
 
 type SentrySyncState = {
 	cursor?: string;
 };
 
-type GranolaSyncState = {
+type GranolaBackfillState = {
 	cursor?: string;
+};
+
+type GranolaDeltaState = {
+	updatedAfter?: string;
+	cursor?: string;
+	cycleMaxUpdatedAt?: string;
 };
 
 type JsonRecord = Record<string, unknown>;
@@ -116,6 +184,39 @@ type GitHubEvent = {
 	created_at?: string;
 };
 
+type GitHubIssue = {
+	id: number;
+	node_id?: string;
+	number: number;
+	title?: string;
+	state?: string;
+	state_reason?: string | null;
+	html_url?: string;
+	comments?: number;
+	locked?: boolean;
+	created_at?: string;
+	updated_at?: string;
+	closed_at?: string | null;
+	user?: {
+		login?: string;
+	};
+	assignees?: Array<{
+		login?: string;
+	}>;
+	labels?: Array<
+		| string
+		| {
+				name?: string;
+		  }
+	>;
+	milestone?: {
+		title?: string;
+	};
+	pull_request?: {
+		html_url?: string;
+	};
+};
+
 type SentryIssue = {
 	id: string;
 	title?: string;
@@ -132,6 +233,9 @@ type SentryIssue = {
 	lastSeen?: string;
 	permalink?: string;
 };
+
+type NormalizedSentryIssue = Required<Pick<SentryIssue, "id">> &
+	Omit<SentryIssue, "id">;
 
 type GranolaListNote = {
 	id: string;
@@ -218,14 +322,70 @@ worker.sync("githubActivitySync", {
 	},
 });
 
+worker.sync("githubIssuesBackfill", {
+	database: githubIssues,
+	mode: "replace",
+	schedule: "manual",
+	execute: async (state: GithubIssuesBackfillState | undefined) => {
+		const page = state?.page ?? 1;
+		const { issues, hasMore } = await fetchGithubIssuesPage({
+			page,
+		});
+
+		return {
+			changes: issues.map(githubIssueChange),
+			hasMore,
+			nextState: hasMore ? { page: page + 1 } : undefined,
+		};
+	},
+});
+
+worker.sync("githubIssuesDelta", {
+	database: githubIssues,
+	mode: "incremental",
+	schedule: "5m",
+	execute: async (state: GithubIssuesDeltaState | undefined) => {
+		const updatedSince =
+			state?.updatedSince ?? bufferedGithubDeltaCursor(new Date());
+		const page = state?.page ?? 1;
+		const { issues, hasMore } = await fetchGithubIssuesPage({
+			page,
+			updatedSince,
+		});
+		const cycleMaxUpdatedAt = maxIsoDate(
+			state?.cycleMaxUpdatedAt,
+			...issues.map((issue) => issue.updated_at),
+		);
+
+		return {
+			changes: issues.map(githubIssueChange),
+			hasMore,
+			nextState: hasMore
+				? {
+						updatedSince,
+						page: page + 1,
+						cycleMaxUpdatedAt,
+					}
+				: {
+						updatedSince: nextGithubDeltaCursor(
+							updatedSince,
+							cycleMaxUpdatedAt,
+						),
+					},
+		};
+	},
+});
+
 worker.sync("sentryIssuesSync", {
 	database: sentryIssues,
 	mode: "replace",
 	schedule: "30m",
 	execute: async (state: SentrySyncState | undefined) => {
 		const token = requireEnv("SENTRY_AUTH_TOKEN");
-		const orgSlug = requireEnv("SENTRY_ORG_SLUG");
-		const allowedProjects = parseCsv(process.env.SENTRY_PROJECT_SLUGS);
+		const orgSlug = requireAnyEnv("SENTRY_ORG_SLUG", "SENTRY_ORG");
+		const allowedProjects = parseCsv(
+			process.env.SENTRY_PROJECT_SLUGS ?? process.env.SENTRY_PROJECT,
+		);
 		const url = new URL(
 			`https://sentry.io/api/0/organizations/${encodeURIComponent(orgSlug)}/issues/`,
 		);
@@ -284,73 +444,525 @@ worker.sync("sentryIssuesSync", {
 	},
 });
 
-worker.sync("granolaNotesSync", {
-	database: granolaNotes,
-	mode: "replace",
-	schedule: "1h",
-	execute: async (state: GranolaSyncState | undefined) => {
-		const token = requireEnv("GRANOLA_API_KEY");
-		const includeTranscript = process.env.GRANOLA_INCLUDE_TRANSCRIPT === "true";
-		const listUrl = new URL("https://public-api.granola.ai/v1/notes");
-		listUrl.searchParams.set("page_size", String(GRANOLA_PAGE_SIZE));
-		if (state?.cursor) {
-			listUrl.searchParams.set("cursor", state.cursor);
-		}
+async function fetchGithubIssuesPage(options: {
+	page: number;
+	updatedSince?: string;
+}): Promise<{ issues: GitHubIssue[]; hasMore: boolean }> {
+	const owner = process.env.GITHUB_OWNER ?? GITHUB_OWNER_DEFAULT;
+	const repo = process.env.GITHUB_REPO ?? GITHUB_REPO_DEFAULT;
+	const token = requireEnv("GITHUB_TOKEN");
+	const url = new URL(
+		`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues`,
+	);
+	url.searchParams.set("state", "all");
+	url.searchParams.set("sort", "updated");
+	url.searchParams.set("direction", "asc");
+	url.searchParams.set("per_page", String(GITHUB_ISSUES_PAGE_SIZE));
+	url.searchParams.set("page", String(options.page));
+	if (options.updatedSince) {
+		url.searchParams.set("since", options.updatedSince);
+	}
 
-		await granolaApi.wait();
-		const page = await fetchJson<{
-			notes: GranolaListNote[];
-			hasMore: boolean;
-			cursor: string | null;
-		}>(
-			listUrl,
+	await githubApi.wait();
+	const response = await fetch(url, {
+		headers: githubHeaders(token),
+	});
+	await assertOk(response, "GitHub issues and pull requests");
+
+	return {
+		issues: (await response.json()) as GitHubIssue[],
+		hasMore: hasNextRel(response.headers.get("link")),
+	};
+}
+
+function githubHeaders(token: string): Record<string, string> {
+	return {
+		Accept: "application/vnd.github+json",
+		Authorization: `Bearer ${token}`,
+		"X-GitHub-Api-Version": "2022-11-28",
+	};
+}
+
+function githubIssueChange(issue: GitHubIssue) {
+	const owner = process.env.GITHUB_OWNER ?? GITHUB_OWNER_DEFAULT;
+	const repo = process.env.GITHUB_REPO ?? GITHUB_REPO_DEFAULT;
+	const repoFullName = `${owner}/${repo}`;
+	const type = issue.pull_request ? "Pull Request" : "Issue";
+	const url = issue.pull_request?.html_url ?? issue.html_url;
+
+	return {
+		type: "upsert" as const,
+		key: String(issue.id),
+		properties: {
+			Title: Builder.title(issue.title ?? `${type} #${issue.number}`),
+			"GitHub Item ID": Builder.richText(String(issue.id)),
+			Number: Builder.number(issue.number),
+			Type: Builder.richText(type),
+			State: Builder.richText(issue.state ?? ""),
+			"State Reason": Builder.richText(issue.state_reason ?? ""),
+			Author: Builder.richText(issue.user?.login ?? ""),
+			Assignees: Builder.richText(
+				(issue.assignees ?? [])
+					.map((assignee) => assignee.login)
+					.filter(Boolean)
+					.join(", "),
+			),
+			Labels: Builder.richText(formatGithubLabels(issue.labels)),
+			Milestone: Builder.richText(issue.milestone?.title ?? ""),
+			Comments: Builder.number(issue.comments ?? 0),
+			Locked: Builder.checkbox(Boolean(issue.locked)),
+			"Created Time": dateTimeOrEmpty(issue.created_at),
+			"Updated Time": dateTimeOrEmpty(issue.updated_at),
+			"Closed Time": dateTimeOrEmpty(issue.closed_at),
+			URL: urlOrEmpty(url),
+			"Repo Full Name": Builder.richText(repoFullName),
+		},
+		upstreamUpdatedAt: issue.updated_at,
+		pageContentMarkdown: githubIssueMarkdown(issue, repoFullName, type, url),
+	};
+}
+
+function formatGithubLabels(labels: GitHubIssue["labels"]): string {
+	return (labels ?? [])
+		.map((label) => (typeof label === "string" ? label : label.name))
+		.filter(Boolean)
+		.join(", ");
+}
+
+function githubIssueMarkdown(
+	issue: GitHubIssue,
+	repoFullName: string,
+	type: string,
+	url: string | undefined,
+): string {
+	return [
+		`# ${issue.title ?? `${type} #${issue.number}`}`,
+		"",
+		`- Type: ${type}`,
+		`- Repo: ${repoFullName}`,
+		`- Number: #${issue.number}`,
+		`- State: ${issue.state ?? "Unknown"}`,
+		`- State reason: ${issue.state_reason ?? "Unknown"}`,
+		`- Author: ${issue.user?.login ?? "Unknown"}`,
+		`- Assignees: ${
+			(issue.assignees ?? [])
+				.map((assignee) => assignee.login)
+				.filter(Boolean)
+				.join(", ") || "None"
+		}`,
+		`- Labels: ${formatGithubLabels(issue.labels) || "None"}`,
+		`- Created: ${issue.created_at ?? "Unknown"}`,
+		`- Updated: ${issue.updated_at ?? "Unknown"}`,
+		`- Closed: ${issue.closed_at ?? "Open"}`,
+		`- Source: ${url ?? "Unavailable"}`,
+	].join("\n");
+}
+
+worker.webhook("sentryIssueAlertWebhook", {
+	title: "Sentry Issue Alert Webhook",
+	description:
+		"Receives verified Sentry issue-alert webhooks and upserts issues into a Notion database.",
+	execute: async (events, { notion }) => {
+		const auth = requireAnyEnv("SENTRY_NOTION_API_TOKEN", "NOTION_API_TOKEN");
+		const databaseOrDataSourceId = requireAnyEnv(
+			"SENTRY_NOTION_DATABASE_ID",
+			"NOTION_SENTRY_DATABASE_ID",
+		);
+		const clientSecret = requireEnv("SENTRY_WEBHOOK_CLIENT_SECRET");
+		const notionClient = notion as unknown as NotionClientLike;
+		const dataSourceId = await resolveDataSourceId(
+			notionClient,
+			auth,
+			databaseOrDataSourceId,
+		);
+
+		for (const event of events) {
+			verifySentryWebhookSignature(
+				event.rawBody,
+				event.headers,
+				clientSecret,
+			);
+
+			const issue = normalizeSentryWebhookIssue(event.body);
+			if (!issue) {
+				console.log(
+					`Ignoring Sentry webhook ${event.deliveryId}: no data.issue payload found.`,
+				);
+				continue;
+			}
+
+			await upsertSentryIssuePage(notionClient, auth, dataSourceId, issue);
+		}
+	},
+});
+
+type NotionClientLike = {
+	databases: {
+		retrieve: (args: Record<string, unknown>) => Promise<unknown>;
+	};
+	dataSources: {
+		query: (args: Record<string, unknown>) => Promise<{
+			results: Array<{ id: string; object: string }>;
+		}>;
+	};
+	pages: {
+		create: (args: Record<string, unknown>) => Promise<unknown>;
+		update: (args: Record<string, unknown>) => Promise<unknown>;
+	};
+};
+
+async function resolveDataSourceId(
+	notion: NotionClientLike,
+	auth: string,
+	databaseOrDataSourceId: string,
+): Promise<string> {
+	const normalizedId = normalizeNotionId(databaseOrDataSourceId);
+
+	try {
+		const database = await notion.databases.retrieve({
+			auth,
+			database_id: normalizedId,
+		});
+		const dataSources = objectValue(database)?.data_sources;
+		const firstDataSource = objectValue(arrayValue(dataSources)[0]);
+		const dataSourceId = stringValue(firstDataSource?.id);
+		if (dataSourceId) {
+			return dataSourceId;
+		}
+	} catch (error) {
+		console.log(
+			`Could not retrieve ${normalizedId} as a database; treating it as a data source ID.`,
+			error instanceof Error ? error.message : error,
+		);
+	}
+
+	return normalizedId;
+}
+
+async function upsertSentryIssuePage(
+	notion: NotionClientLike,
+	auth: string,
+	dataSourceId: string,
+	issue: NormalizedSentryIssue,
+): Promise<void> {
+	const properties = toNotionSentryProperties(issue);
+	const existing = await notion.dataSources.query({
+		auth,
+		data_source_id: dataSourceId,
+		page_size: 1,
+		result_type: "page",
+		filter: {
+			property: "Sentry Issue ID",
+			rich_text: {
+				equals: issue.id,
+			},
+		},
+	});
+	const page = existing.results.find((result) => result.object === "page");
+
+	if (page) {
+		await notion.pages.update({
+			auth,
+			page_id: page.id,
+			properties,
+		});
+		return;
+	}
+
+	await notion.pages.create({
+		auth,
+		parent: {
+			type: "data_source_id",
+			data_source_id: dataSourceId,
+		},
+		properties,
+		markdown: sentryIssueMarkdown(issue),
+	});
+}
+
+function toNotionSentryProperties(issue: NormalizedSentryIssue) {
+	return {
+		Issue: notionTitle(issue.title ?? `Sentry issue ${issue.id}`),
+		"Sentry Issue ID": notionRichText(issue.id),
+		Culprit: notionRichText(issue.culprit ?? ""),
+		Level: notionRichText(issue.level ?? ""),
+		Status: notionRichText(issue.status ?? ""),
+		Project: notionRichText(issue.project?.slug ?? issue.project?.name ?? ""),
+		"User Count": notionNumber(toNumber(issue.userCount)),
+		"Event Count": notionNumber(toNumber(issue.count)),
+		"First Seen": notionDate(issue.firstSeen),
+		"Last Seen": notionDate(issue.lastSeen),
+		Permalink: notionUrl(issue.permalink),
+	};
+}
+
+function notionTitle(content: string) {
+	return {
+		title: [
 			{
-				headers: {
-					Authorization: `Bearer ${token}`,
+				type: "text",
+				text: {
+					content: truncateNotionText(content),
 				},
 			},
-			"Granola notes list",
-		);
+		],
+	};
+}
 
-		const notes = await Promise.all(
-			page.notes.map(async (note) => {
-				await granolaApi.wait();
-				return fetchGranolaNote(note.id, token, includeTranscript);
-			}),
-		);
-
-		return {
-			changes: notes.map((note) => {
-				const summary = note.summary_markdown ?? note.summary_text ?? "";
-				const actionItems = extractActionItems(summary);
-				const attendees = formatPeople(note.attendees ?? note.calendar_event?.invitees);
-				const meetingTime =
-					note.calendar_event?.scheduled_start_time ?? note.created_at;
-
-				return {
-					type: "upsert" as const,
-					key: note.id,
-					properties: {
-						Note: Builder.title(note.title ?? `Granola note ${note.id}`),
-						"Granola Note ID": Builder.richText(note.id),
-						Owner: Builder.richText(formatPerson(note.owner)),
-						Attendees: Builder.richText(attendees),
-						"Meeting Time": dateTimeOrEmpty(meetingTime),
-						Summary: Builder.richText(summary),
-						"Action Items": Builder.richText(actionItems),
-						"Updated Time": dateTimeOrEmpty(note.updated_at),
-						"Web URL": urlOrEmpty(note.web_url),
+function notionRichText(content: string) {
+	return {
+		rich_text: content
+			? [
+					{
+						type: "text",
+						text: {
+							content: truncateNotionText(content),
+						},
 					},
-					upstreamUpdatedAt: note.updated_at,
-					pageContentMarkdown: granolaNoteMarkdown(note, actionItems),
-				};
-			}),
+				]
+			: [],
+	};
+}
+
+function notionNumber(value: number) {
+	return {
+		number: Number.isFinite(value) ? value : 0,
+	};
+}
+
+function notionDate(value: string | undefined) {
+	return {
+		date: value ? { start: value } : null,
+	};
+}
+
+function notionUrl(value: string | undefined) {
+	return {
+		url: value || null,
+	};
+}
+
+function truncateNotionText(content: string, maxLength = 1800): string {
+	if (content.length <= maxLength) {
+		return content;
+	}
+
+	return `${content.slice(0, maxLength - 14)}... truncated`;
+}
+
+function verifySentryWebhookSignature(
+	rawBody: string,
+	headers: Record<string, string>,
+	clientSecret: string,
+): void {
+	const signature = getHeader(headers, "sentry-hook-signature");
+	if (!signature) {
+		throw new WebhookVerificationError("Missing Sentry-Hook-Signature");
+	}
+
+	const expected = crypto
+		.createHmac("sha256", clientSecret)
+		.update(rawBody)
+		.digest("hex");
+
+	if (!timingSafeEqual(signature, expected)) {
+		throw new WebhookVerificationError("Invalid Sentry-Hook-Signature");
+	}
+}
+
+function timingSafeEqual(actual: string, expected: string): boolean {
+	const actualBuffer = Buffer.from(actual);
+	const expectedBuffer = Buffer.from(expected);
+
+	return (
+		actualBuffer.length === expectedBuffer.length &&
+		crypto.timingSafeEqual(actualBuffer, expectedBuffer)
+	);
+}
+
+function getHeader(
+	headers: Record<string, string>,
+	headerName: string,
+): string | undefined {
+	const normalizedHeaderName = headerName.toLowerCase();
+	const match = Object.entries(headers).find(
+		([name]) => name.toLowerCase() === normalizedHeaderName,
+	);
+	return match?.[1];
+}
+
+function normalizeSentryWebhookIssue(
+	body: Record<string, unknown>,
+): NormalizedSentryIssue | undefined {
+	const data = objectValue(body.data);
+	const issuePayload = objectValue(data?.issue);
+	if (!issuePayload) {
+		return undefined;
+	}
+
+	const eventPayload = objectValue(data?.event);
+	const id = firstString(
+		issuePayload.id,
+		issuePayload.issue_id,
+		eventPayload?.issue_id,
+	);
+	if (!id) {
+		return undefined;
+	}
+
+	const projectSlug = firstString(
+		objectValue(issuePayload.project)?.slug,
+		objectValue(eventPayload?.project)?.slug,
+		issuePayload.project,
+		eventPayload?.project,
+	);
+	const projectName = firstString(
+		objectValue(issuePayload.project)?.name,
+		objectValue(eventPayload?.project)?.name,
+		projectSlug,
+	);
+
+	return {
+		id,
+		title: firstString(
+			issuePayload.title,
+			issuePayload.short_id,
+			eventPayload?.title,
+			eventPayload?.message,
+		),
+		culprit: firstString(issuePayload.culprit, eventPayload?.culprit),
+		level: firstString(issuePayload.level, eventPayload?.level),
+		status: firstString(issuePayload.status, "unresolved"),
+		project:
+			projectSlug || projectName
+				? {
+						slug: projectSlug,
+						name: projectName,
+					}
+				: undefined,
+		count: firstNumberOrString(issuePayload.count, issuePayload.event_count),
+		userCount: firstNumberOrString(
+			issuePayload.userCount,
+			issuePayload.user_count,
+			issuePayload.users,
+		),
+		firstSeen: firstString(issuePayload.firstSeen, issuePayload.first_seen),
+		lastSeen: firstString(
+			issuePayload.lastSeen,
+			issuePayload.last_seen,
+			eventPayload?.datetime,
+			eventPayload?.timestamp,
+		),
+		permalink: firstString(
+			issuePayload.permalink,
+			issuePayload.web_url,
+			issuePayload.url,
+			eventPayload?.web_url,
+			eventPayload?.url,
+		),
+	};
+}
+
+worker.sync("granolaNotesBackfill", {
+	database: granolaNotes,
+	mode: "replace",
+	schedule: "manual",
+	execute: async (state: GranolaBackfillState | undefined) => {
+		const token = requireEnv("GRANOLA_API_KEY");
+		const includeTranscript = process.env.GRANOLA_INCLUDE_TRANSCRIPT === "true";
+
+		const page = await fetchGranolaNotesPage(token, { cursor: state?.cursor });
+		const notes = await fetchGranolaNotes(page.notes, token, includeTranscript);
+		return {
+			changes: notes.map(granolaNoteChange),
 			hasMore: page.hasMore,
 			nextState:
 				page.hasMore && page.cursor ? { cursor: page.cursor } : undefined,
 		};
 	},
 });
+
+worker.sync("granolaNotesDelta", {
+	database: granolaNotes,
+	mode: "incremental",
+	schedule: "5m",
+	execute: async (state: GranolaDeltaState | undefined) => {
+		const token = requireEnv("GRANOLA_API_KEY");
+		const includeTranscript = process.env.GRANOLA_INCLUDE_TRANSCRIPT === "true";
+		const updatedAfter =
+			state?.updatedAfter ?? bufferedGranolaDeltaCursor(new Date());
+
+		const page = await fetchGranolaNotesPage(token, {
+			updatedAfter,
+			cursor: state?.cursor,
+		});
+		const notes = await fetchGranolaNotes(page.notes, token, includeTranscript);
+		const cycleMaxUpdatedAt = maxIsoDate(
+			state?.cycleMaxUpdatedAt,
+			...notes.map((note) => note.updated_at),
+		);
+
+		return {
+			changes: notes.map(granolaNoteChange),
+			hasMore: page.hasMore,
+			nextState:
+				page.hasMore && page.cursor
+					? {
+							updatedAfter,
+							cursor: page.cursor,
+							cycleMaxUpdatedAt,
+						}
+					: {
+							updatedAfter: nextGranolaDeltaCursor(
+								updatedAfter,
+								cycleMaxUpdatedAt,
+							),
+						},
+		};
+	},
+});
+
+async function fetchGranolaNotesPage(
+	token: string,
+	options: { cursor?: string; updatedAfter?: string },
+): Promise<{
+	notes: GranolaListNote[];
+	hasMore: boolean;
+	cursor: string | null;
+}> {
+	const listUrl = new URL("https://public-api.granola.ai/v1/notes");
+	listUrl.searchParams.set("page_size", String(GRANOLA_PAGE_SIZE));
+	if (options.cursor) {
+		listUrl.searchParams.set("cursor", options.cursor);
+	}
+	if (options.updatedAfter) {
+		listUrl.searchParams.set("updated_after", options.updatedAfter);
+	}
+
+	await granolaApi.wait();
+	return fetchJson(
+		listUrl,
+		{
+			headers: {
+				Authorization: `Bearer ${token}`,
+			},
+		},
+		"Granola notes list",
+	);
+}
+
+async function fetchGranolaNotes(
+	notes: GranolaListNote[],
+	token: string,
+	includeTranscript: boolean,
+): Promise<GranolaNote[]> {
+	return Promise.all(
+		notes.map(async (note) => {
+			await granolaApi.wait();
+			return fetchGranolaNote(note.id, token, includeTranscript);
+		}),
+	);
+}
 
 async function fetchGranolaNote(
 	noteId: string,
@@ -373,6 +985,32 @@ async function fetchGranolaNote(
 		},
 		`Granola note ${noteId}`,
 	);
+}
+
+function granolaNoteChange(note: GranolaNote) {
+	const summary = note.summary_markdown ?? note.summary_text ?? "";
+	const actionItems = extractActionItems(summary);
+	const attendees = formatPeople(note.attendees ?? note.calendar_event?.invitees);
+	const meetingTime =
+		note.calendar_event?.scheduled_start_time ?? note.created_at;
+
+	return {
+		type: "upsert" as const,
+		key: note.id,
+		properties: {
+			Note: Builder.title(note.title ?? `Granola note ${note.id}`),
+			"Granola Note ID": Builder.richText(note.id),
+			Owner: Builder.richText(formatPerson(note.owner)),
+			Attendees: Builder.richText(attendees),
+			"Meeting Time": dateTimeOrEmpty(meetingTime),
+			Summary: Builder.richText(summary),
+			"Action Items": Builder.richText(actionItems),
+			"Updated Time": dateTimeOrEmpty(note.updated_at),
+			"Web URL": urlOrEmpty(note.web_url),
+		},
+		upstreamUpdatedAt: note.updated_at,
+		pageContentMarkdown: granolaNoteMarkdown(note, actionItems),
+	};
 }
 
 async function fetchJson<T>(
@@ -424,6 +1062,20 @@ function requireEnv(name: string): string {
 	return value;
 }
 
+function requireAnyEnv(primaryName: string, fallbackName: string): string {
+	const value = process.env[primaryName] ?? process.env[fallbackName];
+	if (!value) {
+		throw new Error(
+			`${primaryName} or ${fallbackName} is required. Set it locally in .env or remotely with ntn workers env set ${primaryName}=...`,
+		);
+	}
+	return value;
+}
+
+function normalizeNotionId(idOrUrl: string): string {
+	return idOrUrl.replace(/^collection:\/\//, "");
+}
+
 function parseCsv(value: string | undefined): string[] {
 	return (value ?? "")
 		.split(",")
@@ -441,6 +1093,55 @@ function dateTimeOrEmpty(value: string | undefined | null): TextValue {
 	} catch {
 		return [];
 	}
+}
+
+function bufferedGithubDeltaCursor(now: Date): string {
+	return new Date(now.getTime() - GITHUB_DELTA_BUFFER_MS).toISOString();
+}
+
+function nextGithubDeltaCursor(
+	previousUpdatedSince: string,
+	cycleMaxUpdatedAt: string | undefined,
+): string {
+	const bufferedCursor = bufferedGithubDeltaCursor(new Date());
+	const nextObservedCursor = cycleMaxUpdatedAt
+		? minIsoDate(cycleMaxUpdatedAt, bufferedCursor)
+		: bufferedCursor;
+
+	return maxIsoDate(previousUpdatedSince, nextObservedCursor) ?? bufferedCursor;
+}
+
+function bufferedGranolaDeltaCursor(now: Date): string {
+	return new Date(now.getTime() - GRANOLA_DELTA_BUFFER_MS).toISOString();
+}
+
+function nextGranolaDeltaCursor(
+	previousUpdatedAfter: string,
+	cycleMaxUpdatedAt: string | undefined,
+): string {
+	const bufferedCursor = bufferedGranolaDeltaCursor(new Date());
+	const nextObservedCursor = cycleMaxUpdatedAt
+		? minIsoDate(cycleMaxUpdatedAt, bufferedCursor)
+		: bufferedCursor;
+
+	return maxIsoDate(previousUpdatedAfter, nextObservedCursor) ?? bufferedCursor;
+}
+
+function maxIsoDate(
+	...values: Array<string | undefined | null>
+): string | undefined {
+	const timestamps = values
+		.map((value) => (value ? Date.parse(value) : NaN))
+		.filter(Number.isFinite);
+	if (timestamps.length === 0) {
+		return undefined;
+	}
+
+	return new Date(Math.max(...timestamps)).toISOString();
+}
+
+function minIsoDate(first: string, second: string): string {
+	return Date.parse(first) <= Date.parse(second) ? first : second;
 }
 
 function urlOrEmpty(value: string | undefined | null): TextValue {
@@ -691,8 +1392,40 @@ function parseSentryNextCursor(linkHeader: string | null): string | undefined {
 	return undefined;
 }
 
+function hasNextRel(linkHeader: string | null): boolean {
+	return Boolean(linkHeader?.split(",").some((part) => /rel="next"/.test(part)));
+}
+
 function compact(values: Array<string | undefined | null>): string[] {
 	return values.filter((value): value is string => Boolean(value));
+}
+
+function firstString(...values: unknown[]): string | undefined {
+	for (const value of values) {
+		const string = stringValue(value);
+		if (string) {
+			return string;
+		}
+	}
+
+	return undefined;
+}
+
+function firstNumberOrString(
+	...values: unknown[]
+): string | number | undefined {
+	for (const value of values) {
+		if (typeof value === "number" && Number.isFinite(value)) {
+			return value;
+		}
+
+		const string = stringValue(value);
+		if (string) {
+			return string;
+		}
+	}
+
+	return undefined;
 }
 
 function stringValue(value: unknown): string {
