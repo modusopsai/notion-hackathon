@@ -17,10 +17,14 @@ const GITHUB_REPO_DEFAULT = "notion-hackathon";
 const GITHUB_EVENTS_PAGE_SIZE = 100;
 const GITHUB_ISSUES_PAGE_SIZE = 100;
 const GITHUB_DELTA_BUFFER_MS = 60_000;
+const GITHUB_NOTION_DATA_SOURCE_ID_DEFAULT =
+	"3623edae28d380cdafa7000b11385255";
 const GRANOLA_PAGE_SIZE = 30;
 const GRANOLA_DELTA_BUFFER_MS = 60_000;
 const GRANOLA_NOTION_DATA_SOURCE_ID_DEFAULT =
 	"3623edae-28d3-8095-958c-000b712611af";
+const SLACK_HISTORY_PAGE_SIZE = 15;
+const SLACK_DELTA_BUFFER_MS = 60_000;
 
 const githubApi = worker.pacer("githubApi", {
 	allowedRequests: 10,
@@ -35,6 +39,11 @@ const sentryApi = worker.pacer("sentryApi", {
 const granolaApi = worker.pacer("granolaApi", {
 	allowedRequests: 5,
 	intervalMs: 1000,
+});
+
+const slackApi = worker.pacer("slackApi", {
+	allowedRequests: readIntegerEnv("SLACK_REQUESTS_PER_MINUTE", 1, 1, 50),
+	intervalMs: 60_000,
 });
 
 const githubActivity = worker.database("githubActivity", {
@@ -124,6 +133,30 @@ const granolaNotes = worker.database("granolaNotes", {
 	},
 });
 
+const slackMessages = worker.database("slackMessages", {
+	type: "managed",
+	initialTitle: "Slack Messages",
+	primaryKeyProperty: "Slack Message ID",
+	schema: {
+		properties: {
+			Message: Schema.title(),
+			"Slack Message ID": Schema.richText(),
+			"Channel ID": Schema.richText(),
+			"Channel Name": Schema.richText(),
+			User: Schema.richText(),
+			"Bot ID": Schema.richText(),
+			Type: Schema.richText(),
+			Subtype: Schema.richText(),
+			Text: Schema.richText(),
+			"Message Time": Schema.date(),
+			"Thread TS": Schema.richText(),
+			"Reply Count": Schema.number("number"),
+			"Edited Time": Schema.date(),
+			"Raw JSON": Schema.richText(),
+		},
+	},
+});
+
 worker.tool("checkNotionConnection", {
 	title: "Check Notion Connection",
 	description: "Verify that NOTION_API_TOKEN can authenticate with the Notion API",
@@ -136,6 +169,88 @@ worker.tool("checkNotionConnection", {
 			ok: true,
 			visibleResults: search.results.length,
 			hasMore: search.has_more,
+		};
+	},
+});
+
+worker.tool<GithubIssuesNotionBackfillInput>("githubIssuesNotionBackfill", {
+	title: "Backfill GitHub Issues to Notion",
+	description:
+		"Fetch one page of GitHub issues and pull requests and upsert them into the configured existing Notion database.",
+	schema: j.object({
+		dryRun: j
+			.boolean()
+			.nullable()
+			.describe("When true, fetch and map data without writing to Notion."),
+		page: j
+			.integer()
+			.nullable()
+			.describe("GitHub REST page number to fetch. Defaults to 1."),
+		updatedSince: j
+			.string()
+			.nullable()
+			.describe("Optional ISO timestamp for GitHub's since filter."),
+	}),
+	execute: async (input, { notion }) => {
+		const page = input.page ?? 1;
+		const dryRun = input.dryRun ?? false;
+		const { issues, hasMore } = await fetchGithubIssuesPage({
+			page,
+			updatedSince: input.updatedSince ?? undefined,
+			usePacer: false,
+		});
+
+		if (dryRun) {
+			return {
+				dryRun,
+				fetched: issues.length,
+				upserted: 0,
+				skipped: issues.length,
+				hasMore,
+				nextInput: hasMore
+					? {
+							dryRun,
+							page: page + 1,
+							updatedSince: input.updatedSince,
+						}
+					: null,
+				sample: issues[0] ? githubIssueNotionPreview(issues[0]) : null,
+			};
+		}
+
+		const notionClient = notion as unknown as NotionClientLike;
+		const auth = githubNotionAuth();
+		const dataSourceId = await resolveDataSourceId(
+			notionClient,
+			auth,
+			githubNotionTargetId(),
+		);
+		const schema = await ensureGithubNotionSchema(
+			notionClient,
+			auth,
+			dataSourceId,
+		);
+
+		let upserted = 0;
+		for (const issue of issues) {
+			await upsertGithubIssuePage(notionClient, auth, dataSourceId, issue, schema);
+			upserted += 1;
+		}
+
+		return {
+			dryRun,
+			fetched: issues.length,
+			upserted,
+			skipped: 0,
+			hasMore,
+			nextInput: hasMore
+				? {
+						dryRun,
+						page: page + 1,
+						updatedSince: input.updatedSince,
+					}
+				: null,
+			sample: null,
 		};
 	},
 });
@@ -154,6 +269,12 @@ type GithubIssuesDeltaState = {
 	cycleMaxUpdatedAt?: string;
 };
 
+type GithubIssuesNotionBackfillInput = {
+	dryRun: boolean | null;
+	page: number | null;
+	updatedSince: string | null;
+};
+
 type SentrySyncState = {
 	cursor?: string;
 };
@@ -166,6 +287,18 @@ type GranolaDeltaState = {
 	updatedAfter?: string;
 	cursor?: string;
 	cycleMaxUpdatedAt?: string;
+};
+
+type SlackBackfillState = {
+	channelIndex?: number;
+	cursor?: string;
+};
+
+type SlackDeltaState = {
+	channelIndex?: number;
+	cursor?: string;
+	oldest?: string;
+	cycleMaxTs?: string;
 };
 
 type JsonRecord = Record<string, unknown>;
@@ -219,6 +352,19 @@ type GitHubIssue = {
 	};
 };
 
+type GitHubWebhookPayload = {
+	action?: string;
+	issue?: GitHubIssue;
+	pull_request?: GitHubIssue;
+	repository?: {
+		full_name?: string;
+		owner?: {
+			login?: string;
+		};
+		name?: string;
+	};
+};
+
 type SentryIssue = {
 	id: string;
 	title?: string;
@@ -268,6 +414,32 @@ type GranolaNote = GranolaListNote & {
 	summary_text?: string | null;
 	summary_markdown?: string | null;
 	transcript?: unknown[] | null;
+};
+
+type SlackMessage = {
+	type?: string;
+	subtype?: string;
+	user?: string;
+	username?: string;
+	bot_id?: string;
+	text?: string;
+	ts: string;
+	thread_ts?: string;
+	reply_count?: number;
+	edited?: {
+		ts?: string;
+		user?: string;
+	};
+};
+
+type SlackHistoryResponse = {
+	ok: boolean;
+	error?: string;
+	messages?: SlackMessage[];
+	has_more?: boolean;
+	response_metadata?: {
+		next_cursor?: string;
+	};
 };
 
 worker.sync("githubActivitySync", {
@@ -378,6 +550,136 @@ worker.sync("githubIssuesDelta", {
 	},
 });
 
+worker.webhook("githubIssuesWebhook", {
+	title: "GitHub Issues and Pull Requests Webhook",
+	description:
+		"Receives verified GitHub issue and pull request webhook deliveries and upserts them into the configured existing Notion database.",
+	execute: async (events, { notion }) => {
+		const secret = requireEnv("GITHUB_WEBHOOK_SECRET");
+		const auth = githubNotionAuth();
+		const notionClient = notion as unknown as NotionClientLike;
+		const dataSourceId = await resolveDataSourceId(
+			notionClient,
+			auth,
+			githubNotionTargetId(),
+		);
+		const schema = await ensureGithubNotionSchema(
+			notionClient,
+			auth,
+			dataSourceId,
+		);
+
+		for (const event of events) {
+			verifyGithubWebhookSignature(event.rawBody, event.headers, secret);
+
+			const payload = objectValue(event.body) as GitHubWebhookPayload | undefined;
+			const issue = normalizeGithubWebhookIssue(payload);
+			if (!issue) {
+				console.log(
+					`Ignoring GitHub webhook ${event.deliveryId}: no issue or pull_request payload found.`,
+				);
+				continue;
+			}
+
+			if (payload?.action === "deleted") {
+				await archiveGithubIssuePage(notionClient, auth, dataSourceId, issue);
+				continue;
+			}
+
+			await upsertGithubIssuePage(notionClient, auth, dataSourceId, issue, schema);
+		}
+	},
+});
+
+worker.sync("slackMessagesBackfill", {
+	database: slackMessages,
+	mode: "replace",
+	schedule: "manual",
+	execute: async (state: SlackBackfillState | undefined) => {
+		const channels = requireSlackChannels();
+		const channelIndex = state?.channelIndex ?? 0;
+		const channel = channels[channelIndex];
+		if (!channel) {
+			return {
+				changes: [],
+				hasMore: false,
+			};
+		}
+
+		const page = await fetchSlackHistoryPage(channel.id, {
+			cursor: state?.cursor,
+		});
+		const nextCursor = page.nextCursor;
+		const nextChannelIndex = channelIndex + 1;
+
+		return {
+			changes: page.messages.map((message) =>
+				slackMessageChange(message, channel),
+			),
+			hasMore: Boolean(nextCursor) || nextChannelIndex < channels.length,
+			nextState: nextCursor
+				? { channelIndex, cursor: nextCursor }
+				: nextChannelIndex < channels.length
+					? { channelIndex: nextChannelIndex }
+					: undefined,
+		};
+	},
+});
+
+worker.sync("slackMessagesDelta", {
+	database: slackMessages,
+	mode: "incremental",
+	schedule: "5m",
+	execute: async (state: SlackDeltaState | undefined) => {
+		const channels = requireSlackChannels();
+		const channelIndex = state?.channelIndex ?? 0;
+		const channel = channels[channelIndex];
+		if (!channel) {
+			return {
+				changes: [],
+				hasMore: false,
+			};
+		}
+
+		const oldest = state?.oldest ?? slackTimestampFromDate(bufferedSlackDeltaDate());
+		const page = await fetchSlackHistoryPage(channel.id, {
+			cursor: state?.cursor,
+			oldest,
+			inclusive: false,
+		});
+		const cycleMaxTs = maxSlackTs(
+			state?.cycleMaxTs,
+			...page.messages.map((message) => message.ts),
+			...page.messages.map((message) => message.edited?.ts),
+		);
+		const nextCursor = page.nextCursor;
+		const nextChannelIndex = channelIndex + 1;
+
+		return {
+			changes: page.messages.map((message) =>
+				slackMessageChange(message, channel),
+			),
+			hasMore: Boolean(nextCursor) || nextChannelIndex < channels.length,
+			nextState: nextCursor
+				? {
+						channelIndex,
+						cursor: nextCursor,
+						oldest,
+						cycleMaxTs,
+					}
+				: nextChannelIndex < channels.length
+					? {
+							channelIndex: nextChannelIndex,
+							oldest,
+							cycleMaxTs,
+						}
+					: {
+							oldest: nextSlackDeltaCursor(oldest, cycleMaxTs),
+						},
+		};
+	},
+});
+
 worker.sync("sentryIssuesSync", {
 	database: sentryIssues,
 	mode: "replace",
@@ -440,6 +742,7 @@ worker.sync("sentryIssuesSync", {
 async function fetchGithubIssuesPage(options: {
 	page: number;
 	updatedSince?: string;
+	usePacer?: boolean;
 }): Promise<{ issues: GitHubIssue[]; hasMore: boolean }> {
 	const owner = process.env.GITHUB_OWNER ?? GITHUB_OWNER_DEFAULT;
 	const repo = process.env.GITHUB_REPO ?? GITHUB_REPO_DEFAULT;
@@ -456,7 +759,9 @@ async function fetchGithubIssuesPage(options: {
 		url.searchParams.set("since", options.updatedSince);
 	}
 
-	await githubApi.wait();
+	if (options.usePacer !== false) {
+		await githubApi.wait();
+	}
 	const response = await fetch(url, {
 		headers: githubHeaders(token),
 	});
@@ -549,6 +854,452 @@ function githubIssueMarkdown(
 		`- Closed: ${issue.closed_at ?? "Open"}`,
 		`- Source: ${url ?? "Unavailable"}`,
 	].join("\n");
+}
+
+type GithubNotionSchema = {
+	titleProperty: string;
+};
+
+function githubNotionAuth(): string {
+	return requireAnyEnv("GITHUB_NOTION_API_TOKEN", "NOTION_API_TOKEN");
+}
+
+function githubNotionTargetId(): string {
+	return (
+		process.env.GITHUB_NOTION_DATA_SOURCE_ID ??
+		process.env.GITHUB_NOTION_DATABASE_ID ??
+		GITHUB_NOTION_DATA_SOURCE_ID_DEFAULT
+	);
+}
+
+async function ensureGithubNotionSchema(
+	notion: NotionClientLike,
+	auth: string,
+	dataSourceId: string,
+): Promise<GithubNotionSchema> {
+	const dataSource = await notion.dataSources.retrieve({
+		auth,
+		data_source_id: dataSourceId,
+	});
+	const properties = objectValue(objectValue(dataSource)?.properties) ?? {};
+	const titleProperty =
+		Object.entries(properties).find(
+			([, property]) => objectValue(property)?.type === "title",
+		)?.[0] ?? "Title";
+	const missingProperties: Record<string, unknown> = {};
+
+	for (const [name, config] of Object.entries({
+		Source: { rich_text: {} },
+		"GitHub Item ID": { rich_text: {} },
+		Number: { number: { format: "number" } },
+		Type: { rich_text: {} },
+		State: { rich_text: {} },
+		"State Reason": { rich_text: {} },
+		Author: { rich_text: {} },
+		Assignees: { rich_text: {} },
+		Labels: { rich_text: {} },
+		Milestone: { rich_text: {} },
+		Comments: { number: { format: "number" } },
+		Locked: { checkbox: {} },
+		"Created Time": { date: {} },
+		"Updated Time": { date: {} },
+		"Closed Time": { date: {} },
+		URL: { url: {} },
+		"Repo Full Name": { rich_text: {} },
+	})) {
+		if (!properties[name]) {
+			missingProperties[name] = config;
+		}
+	}
+
+	if (Object.keys(missingProperties).length > 0) {
+		await notion.dataSources.update({
+			auth,
+			data_source_id: dataSourceId,
+			properties: missingProperties,
+		});
+	}
+
+	return { titleProperty };
+}
+
+async function upsertGithubIssuePage(
+	notion: NotionClientLike,
+	auth: string,
+	dataSourceId: string,
+	issue: GitHubIssue,
+	schema: GithubNotionSchema,
+): Promise<void> {
+	const { properties, markdown } = toNotionGithubIssuePage(issue, schema);
+	const page = await findGithubIssuePage(notion, auth, dataSourceId, issue);
+
+	if (page) {
+		await notion.pages.update({
+			auth,
+			page_id: page.id,
+			archived: false,
+			properties,
+		});
+		await notion.pages.updateMarkdown({
+			auth,
+			page_id: page.id,
+			type: "replace_content",
+			replace_content: {
+				new_str: markdown,
+				allow_deleting_content: true,
+			},
+		});
+		return;
+	}
+
+	await notion.pages.create({
+		auth,
+		parent: {
+			type: "data_source_id",
+			data_source_id: dataSourceId,
+		},
+		properties,
+		markdown,
+	});
+}
+
+async function archiveGithubIssuePage(
+	notion: NotionClientLike,
+	auth: string,
+	dataSourceId: string,
+	issue: GitHubIssue,
+): Promise<void> {
+	const page = await findGithubIssuePage(notion, auth, dataSourceId, issue);
+	if (!page) {
+		return;
+	}
+
+	await notion.pages.update({
+		auth,
+		page_id: page.id,
+		archived: true,
+	});
+}
+
+async function findGithubIssuePage(
+	notion: NotionClientLike,
+	auth: string,
+	dataSourceId: string,
+	issue: GitHubIssue,
+): Promise<{ id: string; object: string } | undefined> {
+	const existing = await notion.dataSources.query({
+		auth,
+		data_source_id: dataSourceId,
+		page_size: 1,
+		result_type: "page",
+		filter: {
+			property: "GitHub Item ID",
+			rich_text: {
+				equals: String(issue.id),
+			},
+		},
+	});
+
+	return existing.results.find((result) => result.object === "page");
+}
+
+function toNotionGithubIssuePage(
+	issue: GitHubIssue,
+	schema: GithubNotionSchema,
+): { properties: Record<string, unknown>; markdown: string } {
+	const owner = process.env.GITHUB_OWNER ?? GITHUB_OWNER_DEFAULT;
+	const repo = process.env.GITHUB_REPO ?? GITHUB_REPO_DEFAULT;
+	const repoFullName = `${owner}/${repo}`;
+	const type = issue.pull_request ? "Pull Request" : "Issue";
+	const url = issue.pull_request?.html_url ?? issue.html_url;
+
+	return {
+		properties: {
+			[schema.titleProperty]: notionTitle(issue.title ?? `${type} #${issue.number}`),
+			Source: notionRichText("GitHub"),
+			"GitHub Item ID": notionRichText(String(issue.id)),
+			Number: notionNumber(issue.number),
+			Type: notionRichText(type),
+			State: notionRichText(issue.state ?? ""),
+			"State Reason": notionRichText(issue.state_reason ?? ""),
+			Author: notionRichText(issue.user?.login ?? ""),
+			Assignees: notionRichText(
+				(issue.assignees ?? [])
+					.map((assignee) => assignee.login)
+					.filter(Boolean)
+					.join(", "),
+			),
+			Labels: notionRichText(formatGithubLabels(issue.labels)),
+			Milestone: notionRichText(issue.milestone?.title ?? ""),
+			Comments: notionNumber(issue.comments ?? 0),
+			Locked: notionCheckbox(Boolean(issue.locked)),
+			"Created Time": notionDate(issue.created_at),
+			"Updated Time": notionDate(issue.updated_at),
+			"Closed Time": notionDate(issue.closed_at ?? undefined),
+			URL: notionUrl(url),
+			"Repo Full Name": notionRichText(repoFullName),
+		},
+		markdown: githubIssueMarkdown(issue, repoFullName, type, url),
+	};
+}
+
+function githubIssueNotionPreview(
+	issue: GitHubIssue,
+): Record<string, string | number | boolean | null> {
+	const owner = process.env.GITHUB_OWNER ?? GITHUB_OWNER_DEFAULT;
+	const repo = process.env.GITHUB_REPO ?? GITHUB_REPO_DEFAULT;
+	const type = issue.pull_request ? "Pull Request" : "Issue";
+
+	return {
+		source: "GitHub",
+		githubItemId: String(issue.id),
+		title: issue.title ?? `${type} #${issue.number}`,
+		number: issue.number,
+		type,
+		state: issue.state ?? "",
+		author: issue.user?.login ?? "",
+		updatedAt: issue.updated_at ?? "",
+		url: issue.pull_request?.html_url ?? issue.html_url ?? "",
+		repoFullName: `${owner}/${repo}`,
+	};
+}
+
+function normalizeGithubWebhookIssue(
+	payload: GitHubWebhookPayload | undefined,
+): GitHubIssue | undefined {
+	if (!payload) {
+		return undefined;
+	}
+
+	return payload.issue ?? payload.pull_request;
+}
+
+function verifyGithubWebhookSignature(
+	rawBody: string,
+	headers: Record<string, string>,
+	secret: string,
+): void {
+	const signature = getHeader(headers, "x-hub-signature-256");
+	if (!signature) {
+		throw new WebhookVerificationError("Missing X-Hub-Signature-256");
+	}
+
+	const expected = `sha256=${crypto
+		.createHmac("sha256", secret)
+		.update(rawBody)
+		.digest("hex")}`;
+
+	if (!timingSafeEqual(signature, expected)) {
+		throw new WebhookVerificationError("Invalid X-Hub-Signature-256");
+	}
+}
+
+type SlackChannelConfig = {
+	id: string;
+	name?: string;
+};
+
+async function fetchSlackHistoryPage(
+	channelId: string,
+	options: {
+		cursor?: string;
+		oldest?: string;
+		inclusive?: boolean;
+	},
+): Promise<{ messages: SlackMessage[]; nextCursor?: string }> {
+	const url = new URL("https://slack.com/api/conversations.history");
+	url.searchParams.set("channel", channelId);
+	url.searchParams.set("limit", String(slackHistoryLimit()));
+	if (options.cursor) {
+		url.searchParams.set("cursor", options.cursor);
+	}
+	if (options.oldest) {
+		url.searchParams.set("oldest", options.oldest);
+		url.searchParams.set("inclusive", options.inclusive ? "true" : "false");
+	}
+
+	await slackApi.wait();
+	const response = await fetch(url, {
+		headers: {
+			Authorization: `Bearer ${requireEnv("SLACK_BOT_TOKEN")}`,
+		},
+	});
+	await assertOk(response, `Slack conversations.history for ${channelId}`);
+
+	const body = (await response.json()) as SlackHistoryResponse;
+	if (!body.ok) {
+		throw new Error(
+			`Slack conversations.history for ${channelId} failed: ${
+				body.error ?? "unknown_error"
+			}`,
+		);
+	}
+
+	const nextCursor = body.response_metadata?.next_cursor?.trim();
+	return {
+		messages: body.messages ?? [],
+		nextCursor: nextCursor || undefined,
+	};
+}
+
+function slackMessageChange(
+	message: SlackMessage,
+	channel: SlackChannelConfig,
+) {
+	const channelName = channel.name ?? "";
+	const title = slackMessageTitle(message, channel);
+	const messageTime = slackDateFromTimestamp(message.ts);
+	const editedTime = message.edited?.ts
+		? slackDateFromTimestamp(message.edited.ts)
+		: undefined;
+
+	return {
+		type: "upsert" as const,
+		key: slackMessageKey(message, channel.id),
+		properties: {
+			Message: Builder.title(title),
+			"Slack Message ID": Builder.richText(slackMessageKey(message, channel.id)),
+			"Channel ID": Builder.richText(channel.id),
+			"Channel Name": Builder.richText(channelName),
+			User: Builder.richText(message.user ?? message.username ?? ""),
+			"Bot ID": Builder.richText(message.bot_id ?? ""),
+			Type: Builder.richText(message.type ?? ""),
+			Subtype: Builder.richText(message.subtype ?? ""),
+			Text: Builder.richText(message.text ?? ""),
+			"Message Time": dateTimeOrEmpty(messageTime),
+			"Thread TS": Builder.richText(message.thread_ts ?? ""),
+			"Reply Count": Builder.number(message.reply_count ?? 0),
+			"Edited Time": dateTimeOrEmpty(editedTime),
+			"Raw JSON": Builder.richText(toBoundedJson(message)),
+		},
+		upstreamUpdatedAt: editedTime ?? messageTime,
+		pageContentMarkdown: slackMessageMarkdown(message, channel),
+	};
+}
+
+function slackMessageTitle(
+	message: SlackMessage,
+	channel: SlackChannelConfig,
+): string {
+	const text = (message.text ?? "").replace(/\s+/g, " ").trim();
+	if (text) {
+		return truncateNotionText(text, 120);
+	}
+
+	const channelLabel = channel.name ? `#${channel.name}` : channel.id;
+	return `Slack message in ${channelLabel} at ${slackDateFromTimestamp(message.ts)}`;
+}
+
+function slackMessageMarkdown(
+	message: SlackMessage,
+	channel: SlackChannelConfig,
+): string {
+	const channelLabel = channel.name ? `#${channel.name}` : channel.id;
+	const lines = [
+		`# ${slackMessageTitle(message, channel)}`,
+		"",
+		`- Channel: ${channelLabel}`,
+		`- Channel ID: ${channel.id}`,
+		`- User: ${message.user ?? message.username ?? "Unknown"}`,
+		`- Message time: ${slackDateFromTimestamp(message.ts)}`,
+		`- Thread TS: ${message.thread_ts ?? "None"}`,
+		`- Reply count: ${message.reply_count ?? 0}`,
+		`- Type: ${message.type ?? "Unknown"}`,
+		`- Subtype: ${message.subtype ?? "None"}`,
+	];
+
+	if (message.edited?.ts) {
+		lines.push(`- Edited: ${slackDateFromTimestamp(message.edited.ts)}`);
+	}
+
+	lines.push("", "## Text", "", message.text ?? "", "", "## Raw JSON", "");
+	lines.push("```json", toBoundedJson(message, 6000), "```");
+	return lines.join("\n");
+}
+
+function slackMessageKey(message: SlackMessage, channelId: string): string {
+	return `${channelId}:${message.ts}`;
+}
+
+function requireSlackChannels(): SlackChannelConfig[] {
+	const channelIds = parseCsv(process.env.SLACK_CHANNEL_IDS);
+	if (channelIds.length === 0) {
+		throw new Error(
+			"SLACK_CHANNEL_IDS is required. Set it to comma-separated Slack channel IDs the app can read, for example C123,C456.",
+		);
+	}
+
+	const namesById = parseSlackChannelNames(process.env.SLACK_CHANNEL_NAMES);
+	return channelIds.map((id) => ({
+		id,
+		name: namesById.get(id),
+	}));
+}
+
+function parseSlackChannelNames(value: string | undefined): Map<string, string> {
+	const names = new Map<string, string>();
+	for (const entry of parseCsv(value)) {
+		const [id, ...nameParts] = entry.split("=");
+		const name = nameParts.join("=").trim();
+		if (id && name) {
+			names.set(id.trim(), name);
+		}
+	}
+	return names;
+}
+
+function slackHistoryLimit(): number {
+	return readIntegerEnv("SLACK_HISTORY_PAGE_SIZE", SLACK_HISTORY_PAGE_SIZE, 1, 200);
+}
+
+function slackDateFromTimestamp(ts: string): string {
+	const millis = Number(ts) * 1000;
+	if (!Number.isFinite(millis)) {
+		return new Date(0).toISOString();
+	}
+
+	return new Date(millis).toISOString();
+}
+
+function slackTimestampFromDate(date: Date): string {
+	const seconds = date.getTime() / 1000;
+	return seconds.toFixed(6);
+}
+
+function bufferedSlackDeltaDate(): Date {
+	return new Date(Date.now() - SLACK_DELTA_BUFFER_MS);
+}
+
+function nextSlackDeltaCursor(
+	previousOldest: string,
+	cycleMaxTs: string | undefined,
+): string {
+	const bufferedCursor = slackTimestampFromDate(bufferedSlackDeltaDate());
+	const nextObservedCursor = cycleMaxTs
+		? minSlackTs(cycleMaxTs, bufferedCursor)
+		: bufferedCursor;
+
+	return maxSlackTs(previousOldest, nextObservedCursor) ?? bufferedCursor;
+}
+
+function maxSlackTs(
+	...values: Array<string | undefined | null>
+): string | undefined {
+	const validValues = values.filter(
+		(value): value is string =>
+			typeof value === "string" && Number.isFinite(Number(value)),
+	);
+	if (validValues.length === 0) {
+		return undefined;
+	}
+
+	return validValues.reduce((max, value) =>
+		Number(value) > Number(max) ? value : max,
+	);
+}
+
+function minSlackTs(first: string, second: string): string {
+	return Number(first) <= Number(second) ? first : second;
 }
 
 worker.webhook("sentryIssueAlertWebhook", {
@@ -723,6 +1474,12 @@ function notionRichText(content: string) {
 function notionNumber(value: number) {
 	return {
 		number: Number.isFinite(value) ? value : 0,
+	};
+}
+
+function notionCheckbox(value: boolean) {
+	return {
+		checkbox: value,
 	};
 }
 
@@ -1209,6 +1966,20 @@ function requireEnv(name: string): string {
 		);
 	}
 	return value;
+}
+
+function readIntegerEnv(
+	name: string,
+	defaultValue: number,
+	minimum: number,
+	maximum: number,
+): number {
+	const parsed = Number(process.env[name]);
+	if (!Number.isFinite(parsed)) {
+		return defaultValue;
+	}
+
+	return Math.max(minimum, Math.min(maximum, Math.floor(parsed)));
 }
 
 function requireAnyEnv(primaryName: string, fallbackName: string): string {
