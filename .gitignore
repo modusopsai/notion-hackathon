@@ -5,3 +5,4 @@ dist/
 node_modules/
 workers.*.json
 workers.json
+.claude/settings.json

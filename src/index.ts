@@ -7,7 +7,9 @@ import {
 import * as Builder from "@notionhq/workers/builder";
 import * as Schema from "@notionhq/workers/schema";
 import { j } from "@notionhq/workers/schema-builder";
-import type { JSONValue, TextValue } from "@notionhq/workers/types";
+import type { TextValue } from "@notionhq/workers/types";
+import { isFullBlock } from "@notionhq/client";
+import type { BlockObjectRequest, Client } from "@notionhq/client";
 
 const worker = new Worker();
 export default worker;
@@ -3401,6 +3403,1115 @@ async function fetchGranolaNotes(
 			return fetchGranolaNote(note.id, token, includeTranscript);
 		}),
 	);
+}
+
+type ThemeSources = {
+	github: string[] | null;
+	sentry: string[] | null;
+	granola: string[] | null;
+	slack: string[] | null;
+};
+
+type Theme = {
+	name: string;
+	type: string;
+	summary: string;
+	confidence: number | null;
+	confidenceReasoning: string | null;
+	momentum: string | null;
+	stakeholders: string[] | null;
+	sources: ThemeSources;
+	insight: string | null;
+	openQuestions: string[] | null;
+	counterEvidence: string[] | null;
+};
+
+type Divergence = {
+	observation: string;
+	sources: string[] | null;
+	hypothesis: string | null;
+	whatToCheck: string | null;
+};
+
+const SOURCE_LABELS: Array<{ key: keyof ThemeSources; label: string }> = [
+	{ key: "github", label: "GitHub" },
+	{ key: "sentry", label: "Sentry" },
+	{ key: "granola", label: "Granola" },
+	{ key: "slack", label: "Slack" },
+];
+
+worker.tool("createSynthesis", {
+	title: "Create Synthesis Page",
+	description:
+		"Publish a Notion synthesis page that names the implicit roadmap a team is building, by triangulating four Notion-synced sources (GitHub commits/PRs, Sentry issues, Granola meeting notes, Slack messages). The Custom Agent reads those databases directly, clusters cross-source signals into themes, names the divergences across sources, and calls this tool with the result. This tool only renders the page; it does no reasoning.",
+	schema: j.object({
+		overview: j
+			.string()
+			.describe(
+				"2 to 4 sentence executive summary of the period: what the implicit roadmap appears to be, what the strongest cross-source signal is, and where the agent has the least confidence. Use hedged language ('appears to', 'suggests', 'likely'). This renders as a callout at the top of the page.",
+			),
+		themes: j
+			.array(
+				j.object({
+					name: j.string().describe("Theme name, 3 to 5 words."),
+					type: j
+						.string()
+						.describe(
+							'One of "feature", "refactor", "infrastructure", "exploration", "fix", "polish".',
+						),
+					summary: j
+						.string()
+						.describe(
+							"1 to 3 sentences describing what is converging here. Hedge where the evidence is thin ('appears to', 'likely', 'suggests').",
+						),
+					confidence: j
+						.number()
+						.describe("0.0 to 1.0 confidence in this theme.")
+						.nullable(),
+					confidenceReasoning: j
+						.string()
+						.describe(
+							"One sentence explaining why this confidence number, not just the number. Show your work: which sources reinforce, which are silent, what's ambiguous. Example: '0.85 — strong GitHub signal (8 commits, 2 PRs) plus a Granola mention; Sentry silent so no user pain confirmation.'",
+						)
+						.nullable(),
+					momentum: j
+						.string()
+						.describe(
+							"One short label for the direction of activity in this theme. Suggested vocabulary: 'rising', 'steady', 'cooling', 'dormant', 'emerging', 'finishing'. Pick what best matches the evidence.",
+						)
+						.nullable(),
+					stakeholders: j
+						.array(j.string())
+						.describe(
+							"Names of people involved across any source (GitHub actors, meeting attendees, Slack participants). Reveals concentration of ownership.",
+						)
+						.nullable(),
+					sources: j
+						.object({
+							github: j
+								.array(j.string())
+								.describe(
+									"Pre-formatted bullets for supporting GitHub events. Format: 'abc1234: fix OAuth redirect (alice)' or 'PR #42: tighten session storage (bob)'.",
+								)
+								.nullable(),
+							sentry: j
+								.array(j.string())
+								.describe(
+									"Pre-formatted bullets for related Sentry issues. Format: 'OAuth callback timeout (5 events, P1)'.",
+								)
+								.nullable(),
+							granola: j
+								.array(j.string())
+								.describe(
+									"Pre-formatted bullets for relevant Granola meeting notes. Format: 'Mon standup: auth issue raised by alice'.",
+								)
+								.nullable(),
+							slack: j
+								.array(j.string())
+								.describe(
+									"Pre-formatted bullets for relevant Slack messages. Format: '#eng-auth: 3 messages this week mentioning OAuth'.",
+								)
+								.nullable(),
+						})
+						.describe(
+							"Per-source supporting evidence. Pass null (not an empty array) for sources that have no signal for this theme.",
+						),
+					insight: j
+						.string()
+						.describe(
+							"1 to 2 sentences of cross-source observation about this theme. Hedge claims you can't fully back. Example: 'Engineering appears to be actively closing this; the meeting cadence has dropped to one mention per week, which likely suggests it's near done rather than abandoned.'",
+						)
+						.nullable(),
+					openQuestions: j
+						.array(j.string())
+						.describe(
+							"1 to 3 hedged inferences or things a PM would want to verify. Each should explicitly hedge: 'Possibly X because Y, would confirm by checking Z.' These are the moments where the agent shows humility about what the data can support.",
+						)
+						.nullable(),
+					counterEvidence: j
+						.array(j.string())
+						.describe(
+							"Optional. 1 to 2 signals that disconfirm or complicate this theme, if any exist. Forces the agent to actively look for disconfirming evidence rather than only confirming. Pass null if there's none.",
+						)
+						.nullable(),
+				}),
+			)
+			.describe(
+				"The implicit roadmap: clusters of cross-source activity the agent inferred.",
+			),
+		divergences: j
+			.array(
+				j.object({
+					observation: j
+						.string()
+						.describe(
+							"One sentence naming a cross-source mismatch. Example: 'Granola mentions search v2 in 3 meetings, but no commits touch it.'",
+						),
+					sources: j
+						.array(j.string())
+						.describe(
+							"Which source names are involved, e.g. ['Granola', 'GitHub']. Optional.",
+						)
+						.nullable(),
+					hypothesis: j
+						.string()
+						.describe(
+							"Optional. One short hedged guess at why this divergence exists. Example: 'Possibly because the work was scoped out in planning but not formally cancelled.'",
+						)
+						.nullable(),
+					whatToCheck: j
+						.string()
+						.describe(
+							"Optional. One specific verification step a PM could take. Example: 'Worth confirming with @alice whether search v2 is still committed for this quarter.'",
+						)
+						.nullable(),
+				}),
+			)
+			.describe(
+				"Top-level mismatches between sources. This is the lean-forward beat of the synthesis: things the work isn't matching the talk, or vice versa.",
+			)
+			.nullable(),
+		title: j
+			.string()
+			.describe(
+				"Title for the synthesis page. Defaults to a timestamped title.",
+			)
+			.nullable(),
+		windowDescription: j
+			.string()
+			.describe(
+				"Human-readable description of the time window the agent analyzed, e.g. 'last 7 days', 'all available activity'. Shown in the page header.",
+			)
+			.nullable(),
+	}),
+	outputSchema: j.object({
+		pageId: j.string(),
+		url: j.string(),
+		themeCount: j.number(),
+		divergenceCount: j.number(),
+	}),
+	execute: async (
+		{ overview, themes, divergences, title, windowDescription },
+		{ notion },
+	) => {
+		const parentPageId = requireEnv("SYNTHESIS_PARENT_PAGE_ID");
+		const pageTitle =
+			title ?? `Synthesis - ${new Date().toISOString().replace(/\..+$/, "Z")}`;
+		const window = windowDescription ?? "the recent window";
+		const divergenceList = divergences ?? [];
+
+		const page = await notion.pages.create({
+			parent: { page_id: parentPageId },
+			properties: {
+				title: {
+					title: [{ type: "text", text: { content: pageTitle } }],
+				},
+			},
+			children: synthesisBlocks(
+				pageTitle,
+				overview,
+				themes,
+				divergenceList,
+				window,
+			),
+		});
+
+		return {
+			pageId: page.id,
+			url: (page as { url?: string }).url ?? "",
+			themeCount: themes.length,
+			divergenceCount: divergenceList.length,
+		};
+	},
+});
+
+function synthesisBlocks(
+	pageTitle: string,
+	overview: string,
+	themes: Theme[],
+	divergences: Divergence[],
+	windowDescription: string,
+): BlockObjectRequest[] {
+	const blocks: BlockObjectRequest[] = [
+		paragraphHeading(pageTitle, "heading_1"),
+		paragraph(
+			`Synthesis of cross-source signals over ${windowDescription}. Themes are the implicit roadmap inferred from GitHub commits, Sentry issues, Granola meeting notes, and Slack messages. Divergences call out where the sources disagree. Claims are hedged where the evidence is thin.`,
+		),
+		callout(overview, "💡"),
+		divider(),
+	];
+
+	if (divergences.length > 0) {
+		blocks.push(paragraphHeading("Where the signals diverge", "heading_2"));
+		blocks.push(
+			paragraph(
+				"Cross-source mismatches. These are the moments where what the team is talking about, breaking on, or merging doesn't line up.",
+			),
+		);
+		for (const d of divergences) {
+			const sources = (d.sources ?? []).filter(Boolean);
+			const tail = sources.length > 0 ? ` (${sources.join(" / ")})` : "";
+			blocks.push(bullet(`${d.observation}${tail}`));
+			if (d.hypothesis) {
+				blocks.push(paragraph(`  Hypothesis: ${d.hypothesis}`));
+			}
+			if (d.whatToCheck) {
+				blocks.push(paragraph(`  Worth checking: ${d.whatToCheck}`));
+			}
+		}
+		blocks.push(divider());
+	}
+
+	if (themes.length === 0) {
+		blocks.push(paragraph("No themes were provided."));
+		return blocks;
+	}
+
+	blocks.push(paragraphHeading("The implicit roadmap", "heading_2"));
+	blocks.push(
+		paragraph(
+			"Each theme is one coherent line of work the data converges on, regardless of whether it appears on any stated plan.",
+		),
+	);
+
+	for (const theme of themes) {
+		blocks.push(paragraphHeading(theme.name, "heading_3"));
+
+		// Type · confidence · momentum
+		const headerParts: string[] = [`Type: ${theme.type}`];
+		if (typeof theme.confidence === "number") {
+			headerParts.push(`Confidence: ${theme.confidence.toFixed(2)}`);
+		}
+		if (theme.momentum) {
+			headerParts.push(`Momentum: ${theme.momentum}`);
+		}
+		blocks.push(paragraph(headerParts.join("  ·  ")));
+
+		if (theme.confidenceReasoning) {
+			blocks.push(
+				paragraph(`Confidence reasoning: ${theme.confidenceReasoning}`),
+			);
+		}
+
+		if (theme.summary) {
+			blocks.push(paragraph(theme.summary));
+		}
+
+		if (theme.insight) {
+			blocks.push(callout(theme.insight, "🔍"));
+		}
+
+		if (theme.stakeholders && theme.stakeholders.length > 0) {
+			blocks.push(
+				paragraph(`Stakeholders: ${theme.stakeholders.join(", ")}`),
+			);
+		}
+
+		if (theme.openQuestions && theme.openQuestions.length > 0) {
+			blocks.push(paragraph("Open questions:"));
+			for (const q of theme.openQuestions) {
+				blocks.push(bullet(q));
+			}
+		}
+
+		if (theme.counterEvidence && theme.counterEvidence.length > 0) {
+			blocks.push(paragraph("Counter-evidence:"));
+			for (const c of theme.counterEvidence) {
+				blocks.push(bullet(c));
+			}
+		}
+
+		const populatedSources = SOURCE_LABELS.filter(({ key }) => {
+			const list = theme.sources?.[key];
+			return Array.isArray(list) && list.length > 0;
+		});
+
+		if (populatedSources.length > 0) {
+			blocks.push(paragraph("Supporting signals by source:"));
+			for (const { key, label } of populatedSources) {
+				const items = (theme.sources[key] ?? []).filter(Boolean);
+				blocks.push(bullet(`${label} (${items.length}):`));
+				for (const item of items) {
+					blocks.push(bullet(`  ${item}`));
+				}
+			}
+		}
+
+		blocks.push(divider());
+	}
+
+	return blocks;
+}
+
+// ============================================================================
+// read* tools — bulk-fetch synced substrate with full page bodies parsed
+// ============================================================================
+//
+// The Notion Custom Agent calls these once per source to get all the recent
+// data in a single structured payload, rather than opening pages individually.
+// The agent does the cross-source clustering; these tools do the mechanical
+// page-body reads and JSON parsing the agent shouldn't waste tokens on.
+
+type ParsedBody = {
+	markdown: string;
+	codeBlocks: Array<{ language: string; content: string }>;
+};
+
+async function readPageBody(notion: Client, pageId: string): Promise<ParsedBody> {
+	const lines: string[] = [];
+	const codeBlocks: Array<{ language: string; content: string }> = [];
+
+	let cursor: string | undefined;
+	do {
+		const response = await notion.blocks.children.list({
+			block_id: pageId,
+			start_cursor: cursor,
+			page_size: 100,
+		});
+
+		for (const block of response.results) {
+			if (!isFullBlock(block)) continue;
+
+			switch (block.type) {
+				case "paragraph": {
+					lines.push(richTextToString(block.paragraph.rich_text));
+					break;
+				}
+				case "heading_1": {
+					lines.push(`# ${richTextToString(block.heading_1.rich_text)}`);
+					break;
+				}
+				case "heading_2": {
+					lines.push(`## ${richTextToString(block.heading_2.rich_text)}`);
+					break;
+				}
+				case "heading_3": {
+					lines.push(`### ${richTextToString(block.heading_3.rich_text)}`);
+					break;
+				}
+				case "bulleted_list_item": {
+					lines.push(
+						`- ${richTextToString(block.bulleted_list_item.rich_text)}`,
+					);
+					break;
+				}
+				case "numbered_list_item": {
+					lines.push(
+						`1. ${richTextToString(block.numbered_list_item.rich_text)}`,
+					);
+					break;
+				}
+				case "code": {
+					const content = richTextToString(block.code.rich_text);
+					const language = block.code.language ?? "plain";
+					codeBlocks.push({ language, content });
+					lines.push("```" + language);
+					lines.push(content);
+					lines.push("```");
+					break;
+				}
+				case "callout": {
+					lines.push(`> ${richTextToString(block.callout.rich_text)}`);
+					break;
+				}
+				case "quote": {
+					lines.push(`> ${richTextToString(block.quote.rich_text)}`);
+					break;
+				}
+				case "divider": {
+					lines.push("---");
+					break;
+				}
+				default: {
+					break;
+				}
+			}
+		}
+
+		if (!response.has_more || !response.next_cursor) break;
+		cursor = response.next_cursor;
+	} while (cursor);
+
+	return { markdown: lines.join("\n"), codeBlocks };
+}
+
+function richTextToString(items: Array<{ plain_text?: string }>): string {
+	return items.map((r) => r.plain_text ?? "").join("");
+}
+
+function readPropertyValue(prop: unknown): string | number | boolean | null {
+	const record = objectValue(prop);
+	if (!record) return null;
+	const type = stringValue(record.type);
+
+	switch (type) {
+		case "title":
+			return richTextToString(
+				arrayValue(record.title) as Array<{ plain_text?: string }>,
+			);
+		case "rich_text":
+			return richTextToString(
+				arrayValue(record.rich_text) as Array<{ plain_text?: string }>,
+			);
+		case "number":
+			return typeof record.number === "number" ? record.number : null;
+		case "checkbox":
+			return typeof record.checkbox === "boolean" ? record.checkbox : null;
+		case "date": {
+			const date = objectValue(record.date);
+			return date ? stringValue(date.start) : null;
+		}
+		case "select": {
+			const sel = objectValue(record.select);
+			return sel ? stringValue(sel.name) : null;
+		}
+		case "multi_select":
+			return arrayValue(record.multi_select)
+				.map((m) => stringValue(objectValue(m)?.name))
+				.filter(Boolean)
+				.join(", ");
+		case "status": {
+			const s = objectValue(record.status);
+			return s ? stringValue(s.name) : null;
+		}
+		case "url":
+			return stringValue(record.url);
+		case "email":
+			return stringValue(record.email);
+		case "phone_number":
+			return stringValue(record.phone_number);
+		case "created_time":
+			return stringValue(record.created_time);
+		case "last_edited_time":
+			return stringValue(record.last_edited_time);
+		case "people":
+			return arrayValue(record.people)
+				.map((p) => {
+					const person = objectValue(p);
+					return (
+						stringValue(person?.name) || stringValue(person?.id)
+					);
+				})
+				.filter(Boolean)
+				.join(", ");
+		case "files":
+			return arrayValue(record.files)
+				.map((f) => stringValue(objectValue(f)?.name))
+				.filter(Boolean)
+				.join(", ");
+		default:
+			return null;
+	}
+}
+
+function queryPropertyValue(
+	properties: JsonRecord | undefined,
+	name: string,
+): string | number | boolean | null {
+	if (!properties) return null;
+	return readPropertyValue(properties[name]);
+}
+
+function pageProperties(page: unknown): JsonRecord | undefined {
+	const record = objectValue(page);
+	return record ? objectValue(record.properties) : undefined;
+}
+
+function pageId(page: unknown): string {
+	return stringValue(objectValue(page)?.id);
+}
+
+function findFirstJsonPayload(
+	codeBlocks: Array<{ language: string; content: string }>,
+): JsonRecord | undefined {
+	const json = codeBlocks.find(
+		(c) => c.language === "json" || c.language === "plain",
+	);
+	if (!json) return undefined;
+	try {
+		const cleaned = json.content.replace(/\n\.\.\. truncated$/, "");
+		return objectValue(JSON.parse(cleaned));
+	} catch {
+		return undefined;
+	}
+}
+
+// ---------- readGithubActivity ---------------------------------------------
+
+worker.tool("readGithubActivity", {
+	title: "Read GitHub Activity",
+	description:
+		"Fetch recent rows from the GitHub Activity Notion database with each page body parsed. Returns structured commits and pull request details extracted from the full event payload (not the truncated property). The Notion Custom Agent calls this to get rich GitHub substrate for theme clustering, rather than opening each page individually.",
+	schema: j.object({
+		sinceDays: j
+			.number()
+			.describe("Look back N days. Defaults to 14, cap 90.")
+			.nullable(),
+		limit: j
+			.number()
+			.describe("Max rows to fetch. Defaults to 30, cap 200.")
+			.nullable(),
+		types: j
+			.array(j.string())
+			.describe(
+				"GitHub event types to include, e.g. ['PushEvent', 'PullRequestEvent']. If omitted, returns all types.",
+			)
+			.nullable(),
+	}),
+	outputSchema: j.object({
+		events: j.array(
+			j.object({
+				id: j.string(),
+				type: j.string(),
+				actor: j.string(),
+				repo: j.string(),
+				branch: j.string(),
+				createdAt: j.string(),
+				url: j.string(),
+				payloadSummary: j.string(),
+				commits: j
+					.array(
+						j.object({
+							sha: j.string(),
+							message: j.string(),
+							author: j.string(),
+						}),
+					)
+					.nullable(),
+				pullRequest: j
+					.object({
+						number: j.number(),
+						title: j.string(),
+						action: j.string(),
+						state: j.string(),
+					})
+					.nullable(),
+				rawPayload: j.string().nullable(),
+			}),
+		),
+		totalReturned: j.number(),
+	}),
+	execute: async ({ sinceDays, limit, types }, { notion }) => {
+		const dataSourceId = requireEnv("GITHUB_ACTIVITY_DATA_SOURCE_ID");
+		const lookback = Math.min(sinceDays ?? 14, 90);
+		const max = Math.min(limit ?? 30, 200);
+		const since = new Date(
+			Date.now() - lookback * 86_400_000,
+		).toISOString();
+
+		const filter: Record<string, unknown> = {
+			and: [{ property: "Created Time", date: { on_or_after: since } }],
+		};
+		if (types && types.length > 0) {
+			(filter.and as unknown[]).push({
+				or: types.map((t) => ({
+					property: "Type",
+					rich_text: { equals: t },
+				})),
+			});
+		}
+
+		const events: Array<ReturnType<typeof parseGithubEvent>> = [];
+		let cursor: string | undefined;
+		while (events.length < max) {
+			const response = await notion.dataSources.query({
+				data_source_id: dataSourceId,
+				filter: filter as never,
+				sorts: [{ property: "Created Time", direction: "descending" }],
+				page_size: Math.min(100, max - events.length),
+				start_cursor: cursor,
+			});
+
+			for (const page of response.results) {
+				const id = pageId(page);
+				if (!id) continue;
+				const properties = pageProperties(page);
+				if (!properties) continue;
+				const body = await readPageBody(notion, id);
+				const event = parseGithubEvent(properties, body);
+				if (event) events.push(event);
+				if (events.length >= max) break;
+			}
+
+			if (!response.has_more || !response.next_cursor) break;
+			cursor = response.next_cursor;
+		}
+
+		return {
+			events: events.filter((e): e is NonNullable<typeof e> => e !== null),
+			totalReturned: events.length,
+		};
+	},
+});
+
+function parseGithubEvent(
+	properties: JsonRecord,
+	body: ParsedBody,
+): {
+	id: string;
+	type: string;
+	actor: string;
+	repo: string;
+	branch: string;
+	createdAt: string;
+	url: string;
+	payloadSummary: string;
+	commits: Array<{ sha: string; message: string; author: string }> | null;
+	pullRequest: {
+		number: number;
+		title: string;
+		action: string;
+		state: string;
+	} | null;
+	rawPayload: string | null;
+} | null {
+	const id = stringValue(queryPropertyValue(properties, "GitHub Event ID"));
+	if (!id) return null;
+
+	const type = stringValue(queryPropertyValue(properties, "Type"));
+	const actor = stringValue(queryPropertyValue(properties, "Actor"));
+	const repo = stringValue(queryPropertyValue(properties, "Repo"));
+	const branch = stringValue(queryPropertyValue(properties, "Branch/Ref"));
+	const createdAt = stringValue(queryPropertyValue(properties, "Created Time"));
+	const url = stringValue(queryPropertyValue(properties, "URL"));
+	const payloadSummary = stringValue(
+		queryPropertyValue(properties, "Payload Summary"),
+	);
+
+	const payload = findFirstJsonPayload(body.codeBlocks);
+
+	let commits: Array<{ sha: string; message: string; author: string }> | null =
+		null;
+	const commitArr = arrayValue(payload?.commits);
+	if (commitArr.length > 0) {
+		commits = commitArr
+			.map((c) => {
+				const commit = objectValue(c);
+				const author = objectValue(commit?.author);
+				return {
+					sha: stringValue(commit?.sha).slice(0, 7),
+					message: stringValue(commit?.message),
+					author:
+						stringValue(author?.name) || stringValue(author?.email),
+				};
+			})
+			.filter((c) => c.message);
+		if (commits.length === 0) commits = null;
+	}
+
+	let pullRequest: {
+		number: number;
+		title: string;
+		action: string;
+		state: string;
+	} | null = null;
+	const pr = objectValue(payload?.pull_request);
+	if (pr) {
+		const num = pr.number;
+		pullRequest = {
+			number: typeof num === "number" ? num : 0,
+			title: stringValue(pr.title),
+			action: stringValue(payload?.action),
+			state: stringValue(pr.state),
+		};
+	}
+
+	return {
+		id,
+		type,
+		actor,
+		repo,
+		branch,
+		createdAt,
+		url,
+		payloadSummary,
+		commits,
+		pullRequest,
+		rawPayload: payload ? JSON.stringify(payload) : null,
+	};
+}
+
+// ---------- readSentryIssues -----------------------------------------------
+
+worker.tool("readSentryIssues", {
+	title: "Read Sentry Issues",
+	description:
+		"Fetch recent rows from the Sentry Issues Notion database. Returns structured issue records with culprit, level, status, counts, and dates. Useful for the Notion Custom Agent when reasoning about user-facing pain alongside other sources.",
+	schema: j.object({
+		sinceDays: j
+			.number()
+			.describe(
+				"Look back N days based on Last Seen. Defaults to 30, cap 90.",
+			)
+			.nullable(),
+		limit: j
+			.number()
+			.describe("Max rows to fetch. Defaults to 30, cap 200.")
+			.nullable(),
+		levels: j
+			.array(j.string())
+			.describe(
+				"Sentry levels to include, e.g. ['error', 'fatal']. If omitted, returns all levels.",
+			)
+			.nullable(),
+	}),
+	outputSchema: j.object({
+		issues: j.array(
+			j.object({
+				id: j.string(),
+				title: j.string(),
+				culprit: j.string(),
+				level: j.string(),
+				status: j.string(),
+				project: j.string(),
+				userCount: j.number(),
+				eventCount: j.number(),
+				firstSeen: j.string(),
+				lastSeen: j.string(),
+				permalink: j.string(),
+				bodyMarkdown: j.string(),
+			}),
+		),
+		totalReturned: j.number(),
+	}),
+	execute: async ({ sinceDays, limit, levels }, { notion }) => {
+		const dataSourceId = requireEnv("SENTRY_ISSUES_DATA_SOURCE_ID");
+		const lookback = Math.min(sinceDays ?? 30, 90);
+		const max = Math.min(limit ?? 30, 200);
+		const since = new Date(
+			Date.now() - lookback * 86_400_000,
+		).toISOString();
+
+		const filter: Record<string, unknown> = {
+			and: [{ property: "Last Seen", date: { on_or_after: since } }],
+		};
+		if (levels && levels.length > 0) {
+			(filter.and as unknown[]).push({
+				or: levels.map((l) => ({
+					property: "Level",
+					rich_text: { equals: l },
+				})),
+			});
+		}
+
+		const issues: Array<{
+			id: string;
+			title: string;
+			culprit: string;
+			level: string;
+			status: string;
+			project: string;
+			userCount: number;
+			eventCount: number;
+			firstSeen: string;
+			lastSeen: string;
+			permalink: string;
+			bodyMarkdown: string;
+		}> = [];
+		let cursor: string | undefined;
+
+		while (issues.length < max) {
+			const response = await notion.dataSources.query({
+				data_source_id: dataSourceId,
+				filter: filter as never,
+				sorts: [{ property: "Last Seen", direction: "descending" }],
+				page_size: Math.min(100, max - issues.length),
+				start_cursor: cursor,
+			});
+
+			for (const page of response.results) {
+				const id = pageId(page);
+				if (!id) continue;
+				const properties = pageProperties(page);
+				if (!properties) continue;
+				const sentryId = stringValue(
+					queryPropertyValue(properties, "Sentry Issue ID"),
+				);
+				if (!sentryId) continue;
+				const body = await readPageBody(notion, id);
+				const userCount = queryPropertyValue(properties, "User Count");
+				const eventCount = queryPropertyValue(properties, "Event Count");
+
+				issues.push({
+					id: sentryId,
+					title: stringValue(queryPropertyValue(properties, "Issue")),
+					culprit: stringValue(queryPropertyValue(properties, "Culprit")),
+					level: stringValue(queryPropertyValue(properties, "Level")),
+					status: stringValue(queryPropertyValue(properties, "Status")),
+					project: stringValue(queryPropertyValue(properties, "Project")),
+					userCount: typeof userCount === "number" ? userCount : 0,
+					eventCount: typeof eventCount === "number" ? eventCount : 0,
+					firstSeen: stringValue(
+						queryPropertyValue(properties, "First Seen"),
+					),
+					lastSeen: stringValue(
+						queryPropertyValue(properties, "Last Seen"),
+					),
+					permalink: stringValue(
+						queryPropertyValue(properties, "Permalink"),
+					),
+					bodyMarkdown: body.markdown,
+				});
+
+				if (issues.length >= max) break;
+			}
+
+			if (!response.has_more || !response.next_cursor) break;
+			cursor = response.next_cursor;
+		}
+
+		return { issues, totalReturned: issues.length };
+	},
+});
+
+// ---------- readGranolaNotes -----------------------------------------------
+
+worker.tool("readGranolaNotes", {
+	title: "Read Granola Notes",
+	description:
+		"Fetch recent rows from the Granola Notes Notion database with full page bodies. Returns structured note records with owner, attendees, meeting time, summary, action items, and the full body markdown (optionally including transcript content if the sync stored it).",
+	schema: j.object({
+		sinceDays: j
+			.number()
+			.describe(
+				"Look back N days based on Meeting Time. Defaults to 30, cap 180.",
+			)
+			.nullable(),
+		limit: j
+			.number()
+			.describe("Max rows to fetch. Defaults to 20, cap 100.")
+			.nullable(),
+	}),
+	outputSchema: j.object({
+		notes: j.array(
+			j.object({
+				id: j.string(),
+				title: j.string(),
+				owner: j.string(),
+				attendees: j.string(),
+				meetingTime: j.string(),
+				summary: j.string(),
+				actionItems: j.string(),
+				updatedTime: j.string(),
+				webUrl: j.string(),
+				bodyMarkdown: j.string(),
+			}),
+		),
+		totalReturned: j.number(),
+	}),
+	execute: async ({ sinceDays, limit }, { notion }) => {
+		const dataSourceId = requireEnv("GRANOLA_NOTES_DATA_SOURCE_ID");
+		const lookback = Math.min(sinceDays ?? 30, 180);
+		const max = Math.min(limit ?? 20, 100);
+		const since = new Date(
+			Date.now() - lookback * 86_400_000,
+		).toISOString();
+
+		const notes: Array<{
+			id: string;
+			title: string;
+			owner: string;
+			attendees: string;
+			meetingTime: string;
+			summary: string;
+			actionItems: string;
+			updatedTime: string;
+			webUrl: string;
+			bodyMarkdown: string;
+		}> = [];
+		let cursor: string | undefined;
+
+		while (notes.length < max) {
+			const response = await notion.dataSources.query({
+				data_source_id: dataSourceId,
+				filter: {
+					property: "Meeting Time",
+					date: { on_or_after: since },
+				} as never,
+				sorts: [{ property: "Meeting Time", direction: "descending" }],
+				page_size: Math.min(100, max - notes.length),
+				start_cursor: cursor,
+			});
+
+			for (const page of response.results) {
+				const id = pageId(page);
+				if (!id) continue;
+				const properties = pageProperties(page);
+				if (!properties) continue;
+				const noteId = stringValue(
+					queryPropertyValue(properties, "Granola Note ID"),
+				);
+				if (!noteId) continue;
+				const body = await readPageBody(notion, id);
+
+				notes.push({
+					id: noteId,
+					title: stringValue(queryPropertyValue(properties, "Note")),
+					owner: stringValue(queryPropertyValue(properties, "Owner")),
+					attendees: stringValue(
+						queryPropertyValue(properties, "Attendees"),
+					),
+					meetingTime: stringValue(
+						queryPropertyValue(properties, "Meeting Time"),
+					),
+					summary: stringValue(
+						queryPropertyValue(properties, "Summary"),
+					),
+					actionItems: stringValue(
+						queryPropertyValue(properties, "Action Items"),
+					),
+					updatedTime: stringValue(
+						queryPropertyValue(properties, "Updated Time"),
+					),
+					webUrl: stringValue(queryPropertyValue(properties, "Web URL")),
+					bodyMarkdown: body.markdown,
+				});
+
+				if (notes.length >= max) break;
+			}
+
+			if (!response.has_more || !response.next_cursor) break;
+			cursor = response.next_cursor;
+		}
+
+		return { notes, totalReturned: notes.length };
+	},
+});
+
+// ---------- readSlackMessages (generic, schema-agnostic) -------------------
+
+worker.tool("readSlackMessages", {
+	title: "Read Slack Messages",
+	description:
+		"Fetch recent rows from the Slack-synced Notion database. Because the Slack DB is a Notion-managed connector whose schema we don't own, properties are returned generically as name/value pairs along with the full page body markdown. The agent decides what to use.",
+	schema: j.object({
+		limit: j
+			.number()
+			.describe("Max rows to fetch. Defaults to 50, cap 200.")
+			.nullable(),
+	}),
+	outputSchema: j.object({
+		messages: j.array(
+			j.object({
+				id: j.string(),
+				properties: j.array(
+					j.object({
+						name: j.string(),
+						value: j.string(),
+					}),
+				),
+				bodyMarkdown: j.string(),
+			}),
+		),
+		totalReturned: j.number(),
+	}),
+	execute: async ({ limit }, { notion }) => {
+		const dataSourceId = requireEnv("SLACK_MESSAGES_DATA_SOURCE_ID");
+		const max = Math.min(limit ?? 50, 200);
+
+		const messages: Array<{
+			id: string;
+			properties: Array<{ name: string; value: string }>;
+			bodyMarkdown: string;
+		}> = [];
+		let cursor: string | undefined;
+
+		while (messages.length < max) {
+			const response = await notion.dataSources.query({
+				data_source_id: dataSourceId,
+				page_size: Math.min(100, max - messages.length),
+				start_cursor: cursor,
+			});
+
+			for (const page of response.results) {
+				const id = pageId(page);
+				if (!id) continue;
+				const properties = pageProperties(page);
+				if (!properties) continue;
+				const body = await readPageBody(notion, id);
+
+				const flatProps: Array<{ name: string; value: string }> = [];
+				for (const [name, prop] of Object.entries(properties)) {
+					const value = readPropertyValue(prop);
+					if (value === null) continue;
+					flatProps.push({ name, value: String(value) });
+				}
+
+				messages.push({
+					id,
+					properties: flatProps,
+					bodyMarkdown: body.markdown,
+				});
+
+				if (messages.length >= max) break;
+			}
+
+			if (!response.has_more || !response.next_cursor) break;
+			cursor = response.next_cursor;
+		}
+
+		return { messages, totalReturned: messages.length };
+	},
+});
+
+function paragraphHeading(
+	content: string,
+	level: "heading_1" | "heading_2" | "heading_3",
+): BlockObjectRequest {
+	if (level === "heading_1") {
+		return {
+			object: "block",
+			type: "heading_1",
+			heading_1: { rich_text: [{ type: "text", text: { content } }] },
+		};
+	}
+	if (level === "heading_2") {
+		return {
+			object: "block",
+			type: "heading_2",
+			heading_2: { rich_text: [{ type: "text", text: { content } }] },
+		};
+	}
+	return {
+		object: "block",
+		type: "heading_3",
+		heading_3: { rich_text: [{ type: "text", text: { content } }] },
+	};
+}
+
+function paragraph(content: string): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "paragraph",
+		paragraph: {
+			rich_text: [{ type: "text", text: { content } }],
+		},
+	};
+}
+
+function bullet(content: string): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "bulleted_list_item",
+		bulleted_list_item: {
+			rich_text: [{ type: "text", text: { content } }],
+		},
+	};
+}
+
+function callout(content: string, emoji: string): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "callout",
+		callout: {
+			rich_text: [{ type: "text", text: { content } }],
+			icon: { type: "emoji", emoji: emoji as never },
+		},
+	};
+}
+
+function divider(): BlockObjectRequest {
+	return { object: "block", type: "divider", divider: {} };
 }
 
 async function fetchGranolaNote(
