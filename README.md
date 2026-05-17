@@ -1,4 +1,22 @@
-# Notion Hackathon Data Sync Worker
+# Shape Machine
+
+Shape Machine is a Notion-native engineering command center and coding-agent orchestration layer for a product builder, engineering manager, or CTO at a small startup.
+
+It watches the tools where engineering work already happens, turns those signals into durable Notion memory, and routes risky actions through review. The core demo shows GitHub, Sentry, Slack, Granola, and Markdown docs flowing into Notion, then becoming a prioritized Test and Action Queue for humans and coding agents.
+
+## Hackathon Story
+
+Small teams do not miss things because they lack dashboards. They miss things because production alerts, pull requests, Slack context, meeting notes, and docs all live in different systems. Shape Machine turns Notion into the operating layer for that work:
+
+1. Signals arrive from GitHub, Sentry, Slack, Granola, and the Engineering Wiki.
+2. Workers normalize them through syncs, deltas, webhooks, and tools.
+3. Notion becomes the shared engineering memory layer.
+4. The Test and Action Queue prioritizes what to monitor, review, fix, document, or communicate.
+5. Risky actions create approval artifacts such as GitHub pull requests.
+
+See [`DEMO.md`](./DEMO.md), [`ARCHITECTURE.md`](./ARCHITECTURE.md), and [`docs/test-action-queue.md`](./docs/test-action-queue.md) for the judge-facing walkthrough.
+
+## Worker Overview
 
 Notion Worker that syncs operational data from GitHub, Sentry, Granola, and Slack into managed Notion databases.
 
@@ -26,8 +44,9 @@ Replace-mode syncs delete stale rows only after every page in the upstream datas
 ## Webhooks
 
 - `sentryIssueAlertWebhook`: receives Sentry issue-alert webhook deliveries, verifies `Sentry-Hook-Signature`, and upserts the issue into an existing Notion database.
-- `startupDocsGithubPushWebhook`: receives GitHub push deliveries for Startup Intros Markdown docs and updates the existing Notion Wiki pages.
+- `startupDocsGithubPushWebhook`: receives GitHub push deliveries for repository Markdown docs and updates the existing Notion Wiki pages.
 - `startupDocsNotionPageWebhook`: receives Notion Wiki page update deliveries and opens GitHub pull requests for mapped Markdown files.
+- `issueTrackerAgentWebhook`: receives Notion Issue Tracker page update deliveries, checks `Assign > Coding agent`, and when it is `Claude Code` or `Codex`, saves agent scope/output back to the task and opens a GitHub pull request.
 
 The webhook writes through the Notion API into the same configured Sentry Notion data source used by `sentryIssuesSync`. Keep `sentryIssuesSync` enabled as a backfill/recovery path for missed webhook deliveries.
 
@@ -40,24 +59,41 @@ GITHUB_TOKEN=
 GITHUB_OWNER=StartupIntros
 GITHUB_REPO=startupintros-nextjs
 GITHUB_NOTION_API_TOKEN=
-GITHUB_NOTION_DATA_SOURCE_ID=3623edae28d380cdafa7000b11385255
+GITHUB_NOTION_DATA_SOURCE_ID=38c7f2fd-c22e-820a-bf61-8776f5f060d9
 GITHUB_WEBHOOK_SECRET=
 GITHUB_CONTEXT_COMMENTS_LIMIT=10
 GITHUB_CONTEXT_FILES_LIMIT=50
 GITHUB_CONTEXT_COMMITS_LIMIT=20
 GITHUB_CONTEXT_REVIEWS_LIMIT=20
 
-STARTUP_DOCS_GITHUB_OWNER=StartupIntros
-STARTUP_DOCS_GITHUB_REPO=startupintros-nextjs
+STARTUP_DOCS_GITHUB_OWNER=modusopsai
+STARTUP_DOCS_GITHUB_REPO=notion-hackathon
 STARTUP_DOCS_GITHUB_BRANCH=main
+STARTUP_DOCS_GITHUB_TOKEN=
 STARTUP_DOCS_GITHUB_WEBHOOK_SECRET=
 STARTUP_DOCS_NOTION_API_TOKEN=
-STARTUP_DOCS_NOTION_DATA_SOURCE_ID=3633edae-28d3-8028-b316-000bc8522720
+STARTUP_DOCS_NOTION_DATA_SOURCE_ID=9e47f2fd-c22e-8381-9c3d-878b7be120ea
+STARTUP_DOCS_MATCH_TITLE_FALLBACK=false
+
+ISSUE_TRACKER_NOTION_API_TOKEN=
+ISSUE_TRACKER_NOTION_DATA_SOURCE_ID=
+ISSUE_TRACKER_AGENT_PROPERTY=Assign > Coding agent
+ISSUE_TRACKER_AGENT_VALUES=Claude Code,Codex
+ISSUE_TRACKER_WEBHOOK_SECRET=
+ACTION_AGENT_WEBHOOK_URL=
+ACTION_AGENT_WEBHOOK_SECRET=
+ACTION_QUEUE_GITHUB_OWNER=modusopsai
+ACTION_QUEUE_GITHUB_REPO=notion-hackathon
+ACTION_QUEUE_GITHUB_BASE_BRANCH=main
+ACTION_QUEUE_GITHUB_TOKEN=
+OPENAI_API_KEY=
+OPENAI_CODE_MODEL=gpt-5.3-codex
+OPENAI_CODE_REASONING_EFFORT=high
 
 NOTION_API_TOKEN=
 SENTRY_NOTION_API_TOKEN=
 NOTION_SENTRY_DATABASE_ID=
-SENTRY_NOTION_DATABASE_ID=
+SENTRY_NOTION_DATABASE_ID=3aa7f2fd-c22e-8393-bcd5-8776f5f060d9
 
 SENTRY_AUTH_TOKEN=
 SENTRY_ORG_SLUG=
@@ -66,7 +102,6 @@ SENTRY_WEBHOOK_CLIENT_SECRET=
 
 GRANOLA_API_KEY=
 GRANOLA_INCLUDE_TRANSCRIPT=false
-GRANOLA_NOTION_DATA_SOURCE_ID=3623edae-28d3-8095-958c-000b712611af
 
 SLACK_BOT_TOKEN=
 SLACK_CHANNEL_IDS=C1234567890,D1234567890,G1234567890
@@ -79,11 +114,13 @@ SLACK_REQUESTS_PER_MINUTE=1
 
 This worker repo defaults to `modusopsai/notion-hackathon` in source. Set `GITHUB_OWNER=StartupIntros` and `GITHUB_REPO=startupintros-nextjs` in `.env` or remote worker env when you want the syncs to pull Startup Intros data.
 
-`GITHUB_NOTION_DATA_SOURCE_ID` points at the existing Notion data source that should receive GitHub issues and pull requests. The default target is the `GitHub DB` data source, `3623edae28d380cdafa7000b11385255`, inside the `Data Sources` database. `GITHUB_NOTION_API_TOKEN` is preferred for deployed GitHub Notion writes; the worker falls back to `NOTION_API_TOKEN` locally. `GITHUB_WEBHOOK_SECRET` must match the secret configured on the GitHub webhook.
+`GITHUB_NOTION_DATA_SOURCE_ID` points at the existing Notion data source that should receive GitHub issues and pull requests. The current Shape Machine target is `GitHub DB (1)`, `38c7f2fd-c22e-820a-bf61-8776f5f060d9`, inside the shared data-source database. `GITHUB_NOTION_API_TOKEN` is preferred for deployed GitHub Notion writes; the worker falls back to `NOTION_API_TOKEN` locally. `GITHUB_WEBHOOK_SECRET` must match the secret configured on the GitHub webhook.
 
 Direct GitHub Notion writes enrich each issue/PR page with the full description, recent comments, and, for pull requests, reviews, changed files, and commits. `GITHUB_CONTEXT_COMMENTS_LIMIT`, `GITHUB_CONTEXT_FILES_LIMIT`, `GITHUB_CONTEXT_COMMITS_LIMIT`, and `GITHUB_CONTEXT_REVIEWS_LIMIT` bound the extra GitHub API reads and page body size. Set a limit to `0` to skip that section.
 
-The Startup Intros docs sync watches only `README.md`, `docs/README.md`, `docs/product/**`, `docs/architecture/adr/**`, and `docs/runbooks/**` in `StartupIntros/startupintros-nextjs`. GitHub-to-Notion updates write directly to the existing Wiki data source. Notion-to-GitHub updates never push to `main`; they create a branch and pull request for review. `STARTUP_DOCS_GITHUB_WEBHOOK_SECRET` can differ from `GITHUB_WEBHOOK_SECRET`, and `STARTUP_DOCS_NOTION_API_TOKEN` can differ from `NOTION_API_TOKEN` when deployed. `GITHUB_TOKEN` needs contents read/write and pull-request write access for the Startup Intros repository.
+The Markdown docs sync watches all Markdown files in the configured repository. It defaults to `modusopsai/notion-hackathon` and the Shape Machine `Wiki` data source, `9e47f2fd-c22e-8381-9c3d-878b7be120ea`, resolved from database `a5a7f2fd-c22e-82b3-99d7-816369fba4bb`. GitHub-to-Notion updates write directly to the existing Wiki data source and match existing pages by `GitHub Path`; set `STARTUP_DOCS_MATCH_TITLE_FALLBACK=true` only when importing into a legacy Wiki that lacks path metadata. Notion-to-GitHub updates never push to `main`; they create a branch and pull request for review. `STARTUP_DOCS_GITHUB_TOKEN` can override `GITHUB_TOKEN` when the docs repository needs different GitHub access. `STARTUP_DOCS_GITHUB_WEBHOOK_SECRET` can differ from `GITHUB_WEBHOOK_SECRET`, and `STARTUP_DOCS_NOTION_API_TOKEN` can differ from `NOTION_API_TOKEN` when deployed. The docs GitHub token needs contents read/write and pull-request write access for the configured repository.
+
+The Issue Tracker agent workflow is driven by `issueTrackerAgentWebhook` or the manual `issueTrackerAgentDispatch` tool. `ISSUE_TRACKER_AGENT_PROPERTY` defaults to the screenshot field, `Assign > Coding agent`, and `ISSUE_TRACKER_AGENT_VALUES` defaults to `Claude Code,Codex`. When `ACTION_AGENT_WEBHOOK_URL` is set, the worker posts a normalized task payload to that runner and expects optional `scopeMarkdown`, `summary`, `branchName`, `commitMessage`, `prTitle`, `prBody`, and `files` output. When no runner URL is configured and `OPENAI_API_KEY` is set, the worker calls the OpenAI Responses API with `OPENAI_CODE_MODEL` and expects the same structured output. When neither runner is configured, the worker still creates a deterministic scope artifact PR under `docs/agent-scopes/` so the full Notion-to-GitHub approval path can be demoed quickly. `ACTION_QUEUE_GITHUB_TOKEN` needs contents write and pull-request write access for the target repository; it falls back to `STARTUP_DOCS_GITHUB_TOKEN` and then `GITHUB_TOKEN`.
 
 `SENTRY_NOTION_API_TOKEN` is required for deployed webhook writes to Notion. The worker also accepts `NOTION_API_TOKEN` locally for non-tool capabilities or local Notion API checks that use an internal integration token. Create one at https://www.notion.so/profile/integrations/internal, grant it access to the relevant pages/databases, then paste the token into `.env`.
 
@@ -91,9 +128,9 @@ The Startup Intros docs sync watches only `README.md`, `docs/README.md`, `docs/p
 
 `SENTRY_WEBHOOK_CLIENT_SECRET` must match the client secret from the Sentry service hook or internal integration that sends issue-alert webhook deliveries.
 
-`SENTRY_ORG_SLUG` and `SENTRY_PROJECT_SLUGS` are preferred names. The worker also accepts the existing local aliases `SENTRY_ORG` and `SENTRY_PROJECT`. `SENTRY_PROJECT_SLUGS` accepts a comma-separated list. `GRANOLA_INCLUDE_TRANSCRIPT=true` includes transcript text in page content when Granola returns it; database properties still store summary and action items only.
+`SENTRY_ORG_SLUG` and `SENTRY_PROJECT_SLUGS` are preferred names. The worker also accepts the existing local aliases `SENTRY_ORG` and `SENTRY_PROJECT`. `SENTRY_PROJECT_SLUGS` accepts a comma-separated list.
 
-`GRANOLA_NOTION_DATA_SOURCE_ID` points at the existing Notion database/data source that should receive Granola notes. The default target is `3623edae-28d3-8095-958c-000b712611af`. Make sure the `NOTION_API_TOKEN` internal integration has access to that database. The Granola syncs write directly to this data source through the Notion API; do not use `--preview` for Granola syncs because direct Notion writes still happen inside the sync execution.
+`GRANOLA_INCLUDE_TRANSCRIPT=true` includes transcript text in page content when Granola returns it; database properties still store summary and action items only. Granola syncs write through the worker-managed `Granola Notes` database, so `--preview` is safe and does not write to Notion.
 
 Granola's MCP endpoint (`https://mcp.granola.ai/mcp`) is for authenticated AI-client query access, not automated worker sync. The worker uses Granola's REST API because Granola API webhooks are not available yet.
 
@@ -107,25 +144,47 @@ Slack's history API is cursor-paginated and returns messages newest-first. The b
 
 ## Commands
 
+Safe local demo validation does not write to Notion or GitHub:
+
+```bash
+npm run demo:check
+```
+
+Equivalent expanded local checks:
+
 ```bash
 npm run check
 ntn doctor
 ntn workers exec checkNotionConnection --local -d '{}'
+ntn workers exec githubIssuesNotionBackfill --local -d '{"dryRun":true,"page":1,"updatedSince":null,"includeContext":false}'
+ntn workers exec startupDocsGithubToNotion --local -d '{"dryRun":true,"paths":null,"ref":null}'
+```
+
+Optional deeper GitHub context check. This fetches issue/PR comments, files, commits, and reviews, so it can take much longer than the default demo check:
+
+```bash
+ntn workers exec githubIssuesNotionBackfill --local -d '{"dryRun":true,"page":1,"updatedSince":null,"includeContext":true}'
+```
+
+Deployed-worker checks and setup commands:
+
+```bash
 ntn workers deploy
 ntn workers webhooks list
 ntn workers sync trigger githubActivitySync --preview
 ntn workers sync trigger githubIssuesBackfill --preview
 ntn workers sync trigger githubIssuesDelta --preview
-ntn workers exec githubIssuesNotionBackfill --local -d '{"dryRun":true,"page":null,"updatedSince":null,"includeContext":true}'
-ntn workers exec startupDocsGithubToNotion --local -d '{"dryRun":true,"paths":null,"ref":null}'
 ntn workers exec startupDocsGithubToNotion --local -d '{"dryRun":false,"paths":null,"ref":null}'
 ntn workers exec startupDocsNotionToGithub --local -d '{"pageId":"<notion-page-id>","dryRun":true}'
+ntn workers exec issueTrackerAgentDispatch --local -d '{"pageId":"<issue-tracker-page-id>","dryRun":true}'
 ntn workers sync trigger sentryIssuesSync --preview
 ntn workers sync trigger granolaNotesBackfill
 ntn workers sync trigger granolaNotesDelta
 ntn workers sync trigger slackMessagesBackfill --preview
 ntn workers sync trigger slackMessagesDelta --preview
 ```
+
+If a deployed sync preview returns `unauthorized` while local checks pass, treat that as a remote worker environment/deploy issue. Check remote state with `ntn workers sync status --no-watch`, `ntn workers capabilities list`, and `ntn workers env list`; if the remote env is stale, run `ntn workers env push`, then `ntn workers deploy`, then recheck sync status.
 
 ## Sentry webhook setup
 
@@ -139,7 +198,7 @@ ntn workers sync trigger slackMessagesDelta --preview
 ## GitHub webhook setup
 
 1. Make sure the Notion integration token has access to the database identified by `GITHUB_NOTION_DATA_SOURCE_ID`.
-2. Run `ntn workers exec githubIssuesNotionBackfill --local -d '{"dryRun":true,"page":null,"updatedSince":null,"includeContext":true}'` to inspect the first GitHub page without writing.
+2. Run `ntn workers exec githubIssuesNotionBackfill --local -d '{"dryRun":true,"page":1,"updatedSince":null,"includeContext":false}'` to inspect the first GitHub page without writing.
 3. Run `ntn workers exec githubIssuesNotionBackfill --local -d '{"dryRun":false,"page":1,"updatedSince":null,"includeContext":true}'` to write the first page.
 4. Deploy the worker with `ntn workers deploy`.
 5. Run `ntn workers webhooks list` and copy the URL for `githubIssuesWebhook`.
@@ -148,9 +207,9 @@ ntn workers sync trigger slackMessagesDelta --preview
 
 If you change sync state handling or need a full refresh, reset a sync before triggering it:
 
-## Startup docs two-way sync setup
+## Markdown docs two-way sync setup
 
-1. Set `GITHUB_TOKEN` with contents and pull request access for `StartupIntros/startupintros-nextjs`.
+1. Set `STARTUP_DOCS_GITHUB_TOKEN` or `GITHUB_TOKEN` with contents and pull request access for `modusopsai/notion-hackathon`.
 2. Set `STARTUP_DOCS_NOTION_API_TOKEN` or `NOTION_API_TOKEN` and share the Wiki database with that integration.
 3. Run `ntn workers exec startupDocsGithubToNotion --local -d '{"dryRun":true,"paths":null,"ref":null}'` to preview the Markdown files that will sync.
 4. Run `ntn workers exec startupDocsGithubToNotion --local -d '{"dryRun":false,"paths":null,"ref":null}'` once to seed `GitHub Path`, `GitHub SHA`, and sync metadata on the existing Wiki pages.
@@ -158,6 +217,16 @@ If you change sync state handling or need a full refresh, reset a sync before tr
 6. In GitHub, create a repository webhook for `push` events using the `startupDocsGithubPushWebhook` URL and `STARTUP_DOCS_GITHUB_WEBHOOK_SECRET`.
 7. In Notion, subscribe the integration/webhook to Wiki page content updates using the `startupDocsNotionPageWebhook` URL.
 8. Review Notion-originated Markdown changes in GitHub PRs before merging.
+
+## Issue Tracker agent workflow setup
+
+1. Share the Issue Tracker database with the Notion integration token used by `ISSUE_TRACKER_NOTION_API_TOKEN` or `NOTION_API_TOKEN`.
+2. Set `ISSUE_TRACKER_NOTION_DATA_SOURCE_ID` to the Issue Tracker data source ID, or leave it blank and let the worker resolve the data source from the updated page.
+3. Set `ACTION_QUEUE_GITHUB_OWNER`, `ACTION_QUEUE_GITHUB_REPO`, `ACTION_QUEUE_GITHUB_BASE_BRANCH`, and `ACTION_QUEUE_GITHUB_TOKEN`.
+4. Optional: set `ACTION_AGENT_WEBHOOK_URL` to a Codex/Claude runner endpoint. Without it, set `OPENAI_API_KEY` to let the worker call OpenAI directly; without either runner, the worker opens a scope-only PR.
+5. Run `ntn workers exec issueTrackerAgentDispatch --local -d '{"pageId":"<issue-tracker-page-id>","dryRun":true}'` to verify assignment detection and generated scope.
+6. Deploy with `ntn workers deploy`, then run `ntn workers webhooks list`.
+7. In Notion, subscribe the Issue Tracker page update event to the `issueTrackerAgentWebhook` URL. Updates where `Assign > Coding agent` is not `Claude Code` or `Codex` are ignored.
 
 ```bash
 ntn workers sync state reset githubIssuesBackfill

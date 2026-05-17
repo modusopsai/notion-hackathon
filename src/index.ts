@@ -9,7 +9,7 @@ import {
 import * as Builder from "@notionhq/workers/builder";
 import * as Schema from "@notionhq/workers/schema";
 import { j } from "@notionhq/workers/schema-builder";
-import type { TextValue } from "@notionhq/workers/types";
+import type { JSONValue, TextValue } from "@notionhq/workers/types";
 import { isFullBlock } from "@notionhq/client";
 import type { BlockObjectRequest, Client } from "@notionhq/client";
 
@@ -27,16 +27,14 @@ const GITHUB_CONTEXT_COMMENTS_LIMIT = 10;
 const GITHUB_CONTEXT_FILES_LIMIT = 50;
 const GITHUB_CONTEXT_COMMITS_LIMIT = 20;
 const GITHUB_CONTEXT_REVIEWS_LIMIT = 20;
-const STARTUP_DOCS_OWNER_DEFAULT = "StartupIntros";
-const STARTUP_DOCS_REPO_DEFAULT = "startupintros-nextjs";
+const STARTUP_DOCS_OWNER_DEFAULT = "modusopsai";
+const STARTUP_DOCS_REPO_DEFAULT = "notion-hackathon";
 const STARTUP_DOCS_BRANCH_DEFAULT = "main";
 const STARTUP_DOCS_NOTION_DATA_SOURCE_ID_DEFAULT =
-	"3633edae-28d3-8028-b316-000bc8522720";
+	"9e47f2fd-c22e-8381-9c3d-878b7be120ea";
 const STARTUP_DOCS_RELATED_PROPERTY = "Related Wiki Pages";
 const GRANOLA_PAGE_SIZE = 30;
 const GRANOLA_DELTA_BUFFER_MS = 60_000;
-const GRANOLA_NOTION_DATA_SOURCE_ID_DEFAULT =
-	"3623edae-28d3-8095-958c-000b712611af";
 const SLACK_HISTORY_PAGE_SIZE = 15;
 const SLACK_DELTA_BUFFER_MS = 60_000;
 // The company Wiki database lives natively in Notion (not synced by this
@@ -45,6 +43,11 @@ const SLACK_DELTA_BUFFER_MS = 60_000;
 // observed execution (commits, errors, meetings, messages).
 const WIKI_NOTION_DATA_SOURCE_ID_DEFAULT =
 	"3633edae-28d3-8028-b316-000bc8522720";
+const ISSUE_TRACKER_AGENT_PROPERTY_DEFAULT = "Assign > Coding agent";
+const ISSUE_TRACKER_AGENT_VALUES_DEFAULT = "Claude Code,Codex";
+const ACTION_QUEUE_BRANCH_DEFAULT = "main";
+const OPENAI_CODE_MODEL_DEFAULT = "gpt-5.3-codex";
+const OPENAI_CODE_REASONING_EFFORT_DEFAULT = "high";
 
 const githubApi = worker.pacer("githubApi", {
 	allowedRequests: 10,
@@ -194,9 +197,9 @@ worker.tool("checkNotionConnection", {
 });
 
 worker.tool<StartupDocsGithubToNotionInput>("startupDocsGithubToNotion", {
-	title: "Sync Startup Docs From GitHub to Notion",
+	title: "Sync Markdown Docs From GitHub to Notion",
 	description:
-		"Backfill or update Startup Intros Markdown documentation from GitHub into the existing Wiki data source.",
+		"Backfill or update repository Markdown documentation from GitHub into the existing Wiki data source.",
 	schema: j.object({
 		dryRun: j
 			.boolean()
@@ -269,9 +272,9 @@ worker.tool<StartupDocsGithubToNotionInput>("startupDocsGithubToNotion", {
 });
 
 worker.tool<StartupDocsNotionToGithubInput>("startupDocsNotionToGithub", {
-	title: "Open Startup Docs PR From Notion Page",
+	title: "Open Markdown Docs PR From Notion Page",
 	description:
-		"Create a GitHub pull request from one uploaded Startup Intros Wiki page back to its Markdown file.",
+		"Create a GitHub pull request from one uploaded Wiki page back to its Markdown file.",
 	schema: j.object({
 		pageId: j.string().describe("Notion page ID to export back to GitHub."),
 		dryRun: j
@@ -420,6 +423,64 @@ type StartupDocsGithubToNotionInput = {
 type StartupDocsNotionToGithubInput = {
 	pageId: string;
 	dryRun: boolean | null;
+};
+
+type IssueTrackerAgentDispatchInput = {
+	pageId: string;
+	dryRun: boolean | null;
+};
+
+type IssueTrackerAgentPayload = {
+	pageId: string;
+	title: string;
+	agent: string;
+	url?: string;
+	properties: Record<string, unknown>;
+};
+
+type AgentRunnerResult = {
+	runId?: string;
+	summary?: string;
+	scopeMarkdown?: string;
+	branchName?: string;
+	commitMessage?: string;
+	prTitle?: string;
+	prBody?: string;
+	files?: Array<{
+		path?: string;
+		content?: string;
+	}>;
+};
+
+type OpenAIResponseContent = {
+	type?: string;
+	text?: string;
+};
+
+type OpenAIResponseOutput = {
+	type?: string;
+	content?: OpenAIResponseContent[];
+};
+
+type OpenAIResponseBody = {
+	id?: string;
+	output_text?: string;
+	output?: OpenAIResponseOutput[];
+};
+
+type AgentDispatchResult = {
+	skipped?: boolean;
+	reason?: string;
+	pageId: string;
+	agent?: string;
+	dryRun?: boolean;
+	scopeMarkdown?: string;
+	files?: Array<{
+		path: string;
+		content: string;
+	}>;
+	pullRequestUrl?: string | null;
+	runId?: string | null;
 };
 
 type StartupDocsGithubFile = {
@@ -924,9 +985,9 @@ worker.webhook("githubIssuesWebhook", {
 });
 
 worker.webhook("startupDocsGithubPushWebhook", {
-	title: "Startup Docs GitHub Push Webhook",
+	title: "Markdown Docs GitHub Push Webhook",
 	description:
-		"Receives verified GitHub push deliveries and syncs changed Markdown docs into the Startup Intros Notion Wiki.",
+		"Receives verified GitHub push deliveries and syncs changed Markdown docs into the Notion Wiki.",
 	execute: async (events, { notion }) => {
 		const secret = startupDocsGithubWebhookSecret();
 		const notionClient = notion as unknown as NotionClientLike;
@@ -983,7 +1044,7 @@ worker.webhook("startupDocsGithubPushWebhook", {
 });
 
 worker.webhook("startupDocsNotionPageWebhook", {
-	title: "Startup Docs Notion Page Webhook",
+	title: "Markdown Docs Notion Page Webhook",
 	description:
 		"Receives Notion Wiki page update deliveries and opens GitHub pull requests for Markdown doc edits.",
 	execute: async (events, { notion }) => {
@@ -1013,6 +1074,65 @@ worker.webhook("startupDocsNotionPageWebhook", {
 					false,
 					"notion-webhook",
 				);
+			}
+		}
+	},
+});
+
+worker.tool<IssueTrackerAgentDispatchInput>("issueTrackerAgentDispatch", {
+	title: "Dispatch Issue Tracker Coding Agent",
+	description:
+		"Inspect one Issue Tracker task and, when assigned to Claude Code or Codex, save scope back to Notion and open a GitHub pull request.",
+	schema: j.object({
+		pageId: j.string().describe("Issue Tracker Notion page ID to dispatch."),
+		dryRun: j
+			.boolean()
+			.nullable()
+			.describe("When true, scope the task without writing to Notion or GitHub."),
+	}),
+	execute: async (input, { notion }) => {
+		return dispatchIssueTrackerAgent(
+			notion as unknown as NotionClientLike,
+			issueTrackerNotionAuth(),
+			input.pageId,
+			input.dryRun ?? false,
+		);
+	},
+});
+
+worker.webhook("issueTrackerAgentWebhook", {
+	title: "Issue Tracker Coding Agent Webhook",
+	description:
+		"Receives Notion Issue Tracker page update deliveries and routes Claude Code or Codex assignments into an agent scope and GitHub PR.",
+	execute: async (events, { notion }) => {
+		const notionClient = notion as unknown as NotionClientLike;
+		const auth = issueTrackerNotionAuth();
+
+		for (const event of events) {
+			verifyOptionalSharedSecret(
+				event.headers,
+				"ISSUE_TRACKER_WEBHOOK_SECRET",
+			);
+			const pageIds = notionWebhookPageIds(event.body as NotionPageWebhookPayload);
+			if (pageIds.length === 0) {
+				console.log(
+					`Ignoring Issue Tracker webhook ${event.deliveryId}: no page ID found.`,
+				);
+				continue;
+			}
+
+			for (const pageId of pageIds) {
+				const result = await dispatchIssueTrackerAgent(
+					notionClient,
+					auth,
+					pageId,
+					false,
+				);
+				if (result.skipped) {
+					console.log(
+						`Skipped Issue Tracker page ${pageId}: ${result.reason ?? "not dispatchable"}.`,
+					);
+				}
 			}
 		}
 	},
@@ -1139,17 +1259,23 @@ function startupDocsGithubWebhookSecret(): string {
 	return requireAnyEnv("STARTUP_DOCS_GITHUB_WEBHOOK_SECRET", "GITHUB_WEBHOOK_SECRET");
 }
 
+function startupDocsGithubToken(): string {
+	return requireAnyEnv("STARTUP_DOCS_GITHUB_TOKEN", "GITHUB_TOKEN");
+}
+
+function startupDocsMatchTitleFallback(): boolean {
+	return process.env.STARTUP_DOCS_MATCH_TITLE_FALLBACK === "true";
+}
+
 function isStartupDocsPath(path: string): boolean {
 	if (!path.endsWith(".md")) {
 		return false;
 	}
 
-	return (
-		path === "README.md" ||
-		path === "docs/README.md" ||
-		path.startsWith("docs/product/") ||
-		path.startsWith("docs/architecture/adr/") ||
-		path.startsWith("docs/runbooks/")
+	return !(
+		path.startsWith("node_modules/") ||
+		path.startsWith("dist/") ||
+		path.startsWith(".git/")
 	);
 }
 
@@ -1386,7 +1512,7 @@ async function findStartupDocsNotionPage(
 		},
 	});
 	const pathMatch = byPath.results.find((result) => result.object === "page");
-	if (pathMatch || !title) {
+	if (pathMatch || !title || !startupDocsMatchTitleFallback()) {
 		return pathMatch;
 	}
 
@@ -1446,9 +1572,18 @@ function startupDocsNotionMarkdown(file: StartupDocsGithubFile): string {
 }
 
 function startupDocsTitleFromMarkdown(markdown: string, path: string): string {
+	const frontmatterName = /^name:\s*["']?(.+?)["']?\s*$/m.exec(markdown)?.[1];
+	if (frontmatterName && path.endsWith("/SKILL.md")) {
+		return `Skill: ${frontmatterName}`.slice(0, 180);
+	}
+
 	const heading = /^#\s+(.+)$/m.exec(markdown);
 	if (heading) {
-		return stripMarkdownInline(heading[1]).slice(0, 180);
+		const title = stripMarkdownInline(heading[1]);
+		if (title === "Repository Guidelines" && path !== "AGENTS.md") {
+			return `${title} (${path})`.slice(0, 180);
+		}
+		return title.slice(0, 180);
 	}
 
 	const segments = path.split("/");
@@ -1459,10 +1594,19 @@ function startupDocsTitleFromMarkdown(markdown: string, path: string): string {
 }
 
 function startupDocsCategory(path: string): string {
-	if (path.includes("/architecture/adr/")) {
+	if (
+		path.includes("/architecture/") ||
+		path.includes("/adr/") ||
+		path.includes("/skills/")
+	) {
 		return "Engineering";
 	}
-	if (path.includes("/runbooks/")) {
+	if (
+		path.includes("/runbooks/") ||
+		path === "AGENTS.md" ||
+		path === "CLAUDE.md" ||
+		path.includes("INSTRUCTIONS.md")
+	) {
 		return "Operations";
 	}
 	return "Product";
@@ -1472,7 +1616,11 @@ function startupDocsTags(path: string): string[] {
 	const tags = new Set(["Documentation"]);
 	if (path.includes("/runbooks/")) {
 		tags.add("Guide");
-	} else if (path.includes("/decisions/") || path.includes("/adr/")) {
+	} else if (
+		path.includes("/decisions/") ||
+		path.includes("/adr/") ||
+		path.includes("/skills/")
+	) {
 		tags.add("Best Practice");
 	} else {
 		tags.add("Reference");
@@ -1484,7 +1632,7 @@ function startupDocsTags(path: string): string[] {
 }
 
 function startupDocsPriority(path: string): string {
-	return /(^README\.md$|^docs\/README\.md$|prd\.md$|design-doc\.md$|roadmap\.md$|qa-checklists\.md$|release-readiness\.md$|runbooks\/README\.md$)/.test(
+	return /(^README\.md$|^AGENTS\.md$|^CLAUDE\.md$|^\.agents\/INSTRUCTIONS\.md$|^docs\/README\.md$|prd\.md$|design-doc\.md$|roadmap\.md$|qa-checklists\.md$|release-readiness\.md$|runbooks\/README\.md$)/.test(
 		path,
 	)
 		? "High"
@@ -1665,6 +1813,759 @@ async function createStartupDocsGithubPullRequest(
 	);
 }
 
+async function dispatchIssueTrackerAgent(
+	notion: NotionClientLike,
+	auth: string,
+	pageId: string,
+	dryRun: boolean,
+): Promise<AgentDispatchResult> {
+	const page = objectValue(
+		await notion.pages.retrieve({
+			auth,
+			page_id: pageId,
+		}),
+	);
+	if (!page) {
+		return {
+			skipped: true,
+			reason: "Notion page could not be retrieved.",
+			pageId,
+		};
+	}
+
+	const properties = objectValue(page.properties) ?? {};
+	const agent = notionPropertyLabel(
+		properties[issueTrackerAgentPropertyName()],
+	);
+	if (!agent || !issueTrackerDispatchAgents().has(agent.toLowerCase())) {
+		return {
+			skipped: true,
+			reason: `Assignment is ${agent || "empty"}, not Claude Code or Codex.`,
+			pageId,
+		};
+	}
+
+	const existingPrUrl = notionPropertyUrl(properties["Agent PR URL"]);
+	if (existingPrUrl) {
+		return {
+			skipped: true,
+			reason: `Agent PR already exists: ${existingPrUrl}`,
+			pageId,
+			agent,
+			pullRequestUrl: existingPrUrl,
+		};
+	}
+
+	const title = notionPageTitle(properties) || `Issue Tracker task ${pageId}`;
+	const payload: IssueTrackerAgentPayload = {
+		pageId,
+		title,
+		agent,
+		url: stringValue(page.url),
+		properties,
+	};
+	const runnerResult = await runCodingAgent(payload);
+	const scopeMarkdown =
+		runnerResult.scopeMarkdown?.trim() || defaultAgentScopeMarkdown(payload);
+
+	if (dryRun) {
+		return {
+			dryRun,
+			pageId,
+			agent,
+			scopeMarkdown,
+			files: normalizeAgentResultFiles(payload, scopeMarkdown, runnerResult),
+			runId: runnerResult.runId ?? null,
+			pullRequestUrl: null,
+		};
+	}
+
+	const dataSourceId = await resolveIssueTrackerDataSourceId(notion, auth, page);
+	if (dataSourceId) {
+		await ensureIssueTrackerAgentSchema(notion, auth, dataSourceId);
+	}
+
+	const pr = await createIssueTrackerAgentPullRequest(
+		payload,
+		scopeMarkdown,
+		runnerResult,
+	);
+	await saveIssueTrackerAgentResult(notion, auth, pageId, {
+		agent,
+		runId: runnerResult.runId,
+		summary: runnerResult.summary,
+		scopeMarkdown,
+		pullRequestUrl: pr.html_url,
+	});
+
+	return {
+		pageId,
+		agent,
+		runId: runnerResult.runId ?? null,
+		pullRequestUrl: pr.html_url ?? null,
+	};
+}
+
+async function runCodingAgent(
+	payload: IssueTrackerAgentPayload,
+): Promise<AgentRunnerResult> {
+	const runnerUrl = process.env.ACTION_AGENT_WEBHOOK_URL;
+	if (runnerUrl) {
+		return runWebhookCodingAgent(payload, runnerUrl);
+	}
+
+	if (process.env.OPENAI_API_KEY) {
+		return runOpenAICodingAgent(payload);
+	}
+
+	return {
+		summary:
+			"No ACTION_AGENT_WEBHOOK_URL or OPENAI_API_KEY configured; generated a deterministic scope artifact for review.",
+		scopeMarkdown: defaultAgentScopeMarkdown(payload),
+	};
+}
+
+async function runWebhookCodingAgent(
+	payload: IssueTrackerAgentPayload,
+	runnerUrl: string,
+): Promise<AgentRunnerResult> {
+	const response = await fetch(runnerUrl, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			...(process.env.ACTION_AGENT_WEBHOOK_SECRET
+				? {
+						Authorization: `Bearer ${process.env.ACTION_AGENT_WEBHOOK_SECRET}`,
+					}
+				: {}),
+		},
+		body: JSON.stringify({
+			agent: payload.agent,
+			task: {
+				pageId: payload.pageId,
+				title: payload.title,
+				url: payload.url,
+				properties: summarizeNotionProperties(payload.properties),
+			},
+			expect: {
+				scopeMarkdown: true,
+				files: true,
+				pullRequest: true,
+			},
+		}),
+	});
+	await assertOk(response, "Coding agent runner");
+	return objectValue(await response.json()) as AgentRunnerResult;
+}
+
+async function runOpenAICodingAgent(
+	payload: IssueTrackerAgentPayload,
+): Promise<AgentRunnerResult> {
+	const response = await fetch("https://api.openai.com/v1/responses", {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			Authorization: `Bearer ${requireEnv("OPENAI_API_KEY")}`,
+		},
+		body: JSON.stringify({
+			model: openAICodeModel(),
+			input: [
+				{
+					role: "system",
+					content: [
+						{
+							type: "input_text",
+							text: openAICodingAgentSystemPrompt(),
+						},
+					],
+				},
+				{
+					role: "user",
+					content: [
+						{
+							type: "input_text",
+							text: JSON.stringify(openAICodingAgentInput(payload)),
+						},
+					],
+				},
+			],
+			reasoning: {
+				effort: openAICodeReasoningEffort(),
+			},
+			text: {
+				format: {
+					type: "json_schema",
+					name: "agent_runner_result",
+					strict: true,
+					schema: openAIAgentRunnerResultSchema(),
+				},
+			},
+		}),
+	});
+	await assertOk(response, "OpenAI coding agent");
+
+	const body = (await response.json()) as OpenAIResponseBody;
+	const outputText = openAIResponseText(body);
+	if (!outputText) {
+		throw new Error("OpenAI coding agent returned no text output.");
+	}
+
+	const result = objectValue(JSON.parse(outputText));
+	if (!result) {
+		throw new Error("OpenAI coding agent returned a non-object JSON payload.");
+	}
+
+	return normalizeOpenAIAgentRunnerResult(body.id, result);
+}
+
+function openAICodingAgentSystemPrompt(): string {
+	return [
+		"You are a coding agent preparing a GitHub pull request from a Notion Issue Tracker task.",
+		"Return only JSON that matches the provided schema.",
+		"Use the task properties as the source of truth.",
+		"Never claim that tests or commands were run.",
+		"Do not invent repository state. If the task does not contain enough concrete implementation context, return a scope artifact under docs/agent-scopes/ instead of editing application source files.",
+		"Each returned file path must be relative to the repository root and each content value must contain the complete file contents to write.",
+	].join("\n");
+}
+
+function openAICodingAgentInput(payload: IssueTrackerAgentPayload): JsonRecord {
+	return {
+		agent: payload.agent,
+		task: {
+			pageId: payload.pageId,
+			title: payload.title,
+			url: payload.url ?? "",
+			properties: summarizeNotionProperties(payload.properties),
+		},
+		repository: {
+			owner: actionQueueGithubOwner(),
+			name: actionQueueGithubRepo(),
+			baseBranch: actionQueueGithubBaseBranch(),
+		},
+		expectedResult: {
+			summary: "Brief human-readable summary of the proposed change.",
+			scopeMarkdown:
+				"Markdown with task context, intended implementation, verification plan, and any assumptions.",
+			files:
+				"Complete file artifacts to commit. Use a docs/agent-scopes/*.md file when source edits are not safe from task context alone.",
+		},
+	};
+}
+
+function openAIAgentRunnerResultSchema(): JsonRecord {
+	return {
+		type: "object",
+		additionalProperties: false,
+		properties: {
+			runId: { type: "string" },
+			summary: { type: "string" },
+			scopeMarkdown: { type: "string" },
+			branchName: { type: "string" },
+			commitMessage: { type: "string" },
+			prTitle: { type: "string" },
+			prBody: { type: "string" },
+			files: {
+				type: "array",
+				items: {
+					type: "object",
+					additionalProperties: false,
+					properties: {
+						path: { type: "string" },
+						content: { type: "string" },
+					},
+					required: ["path", "content"],
+				},
+			},
+		},
+		required: [
+			"runId",
+			"summary",
+			"scopeMarkdown",
+			"branchName",
+			"commitMessage",
+			"prTitle",
+			"prBody",
+			"files",
+		],
+	};
+}
+
+function openAIResponseText(body: OpenAIResponseBody): string {
+	const directText = stringValue(body.output_text);
+	if (directText) {
+		return directText;
+	}
+
+	for (const output of body.output ?? []) {
+		for (const content of output.content ?? []) {
+			const text = stringValue(content.text);
+			if (text) {
+				return text;
+			}
+		}
+	}
+
+	return "";
+}
+
+function normalizeOpenAIAgentRunnerResult(
+	responseId: string | undefined,
+	result: JsonRecord,
+): AgentRunnerResult {
+	const files = arrayValue(result.files)
+		.map((file) => objectValue(file))
+		.filter((file): file is JsonRecord => Boolean(file))
+		.map((file) => ({
+			path: stringValue(file.path),
+			content: stringValue(file.content),
+		}))
+		.filter((file) => file.path && file.content);
+
+	return {
+		runId: stringValue(result.runId) || responseId,
+		summary: stringValue(result.summary),
+		scopeMarkdown: stringValue(result.scopeMarkdown),
+		branchName: stringValue(result.branchName),
+		commitMessage: stringValue(result.commitMessage),
+		prTitle: stringValue(result.prTitle),
+		prBody: stringValue(result.prBody),
+		files,
+	};
+}
+
+async function createIssueTrackerAgentPullRequest(
+	payload: IssueTrackerAgentPayload,
+	scopeMarkdown: string,
+	runnerResult: AgentRunnerResult,
+): Promise<{ html_url?: string; number?: number }> {
+	const owner = actionQueueGithubOwner();
+	const repo = actionQueueGithubRepo();
+	const base = actionQueueGithubBaseBranch();
+	const token = actionQueueGithubToken();
+	const baseRef = await githubApiRequest<{
+		object?: {
+			sha?: string;
+		};
+	}>(
+		token,
+		"GET",
+		`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/heads/${encodeURIComponent(base)}`,
+	);
+	const baseSha = baseRef.object?.sha;
+	if (!baseSha) {
+		throw new Error(`Could not resolve ${owner}/${repo} ${base} base SHA.`);
+	}
+
+	const branch =
+		runnerResult.branchName?.trim() ||
+		`agents/${slugifyForBranch(payload.agent)}-${slugifyForBranch(payload.title).slice(0, 32)}-${Date.now()}`;
+	await githubApiRequest(
+		token,
+		"POST",
+		`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/refs`,
+		{
+			ref: `refs/heads/${branch}`,
+			sha: baseSha,
+		},
+	);
+
+	const files = normalizeAgentResultFiles(payload, scopeMarkdown, runnerResult);
+	for (const file of files) {
+		const existing = await githubApiRequestOptional<{ sha?: string }>(
+			token,
+			"GET",
+			`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodeURIComponentPath(file.path)}?ref=${encodeURIComponent(branch)}`,
+		);
+		await githubApiRequest(
+			token,
+			"PUT",
+			`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodeURIComponentPath(file.path)}`,
+			{
+				message:
+					runnerResult.commitMessage ??
+					`Add agent scope for ${payload.title}`,
+				content: Buffer.from(file.content, "utf8").toString("base64"),
+				branch,
+				...(existing?.sha ? { sha: existing.sha } : {}),
+			},
+		);
+	}
+
+	return githubApiRequest<{ html_url?: string; number?: number }>(
+		token,
+		"POST",
+		`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls`,
+		{
+			title: runnerResult.prTitle ?? `[${payload.agent}] ${payload.title}`,
+			head: branch,
+			base,
+			body:
+				runnerResult.prBody ??
+				[
+					`Automated ${payload.agent} dispatch from the Notion Issue Tracker.`,
+					"",
+					`Notion task: ${payload.url ?? payload.pageId}`,
+					"",
+					runnerResult.summary ?? "Scope artifact is included in this PR.",
+				].join("\n"),
+		},
+	);
+}
+
+async function saveIssueTrackerAgentResult(
+	notion: NotionClientLike,
+	auth: string,
+	pageId: string,
+	result: {
+		agent: string;
+		runId?: string;
+		summary?: string;
+		scopeMarkdown: string;
+		pullRequestUrl?: string;
+	},
+): Promise<void> {
+	await notion.pages.update({
+		auth,
+		page_id: pageId,
+		properties: {
+			"Agent Status": notionRichText("PR opened"),
+			"Agent Assignee": notionRichText(result.agent),
+			"Agent Run ID": notionRichText(result.runId ?? ""),
+			"Agent Summary": notionRichText(result.summary ?? firstLine(result.scopeMarkdown)),
+			"Agent PR URL": notionUrl(result.pullRequestUrl),
+			"Agent Last Run At": notionDate(new Date().toISOString()),
+		},
+	});
+
+	const existingMarkdown = stringValue(
+		objectValue(
+			await notion.pages.retrieveMarkdown({
+				auth,
+				page_id: pageId,
+			}),
+		)?.markdown,
+	).trimEnd();
+	const agentSection = [
+		"",
+		"## Coding Agent Dispatch",
+		"",
+		`- Agent: ${result.agent}`,
+		`- Run ID: ${result.runId ?? "local-scope"}`,
+		`- Pull request: ${result.pullRequestUrl ?? "Unavailable"}`,
+		`- Updated: ${new Date().toISOString()}`,
+		"",
+		result.scopeMarkdown,
+	].join("\n");
+
+	await notion.pages.updateMarkdown({
+		auth,
+		page_id: pageId,
+		type: "replace_content",
+		replace_content: {
+			new_str: `${existingMarkdown}${agentSection}\n`,
+			allow_deleting_content: true,
+		},
+	});
+}
+
+async function resolveIssueTrackerDataSourceId(
+	notion: NotionClientLike,
+	auth: string,
+	page: JsonRecord,
+): Promise<string | undefined> {
+	const explicitTarget = process.env.ISSUE_TRACKER_NOTION_DATA_SOURCE_ID;
+	if (explicitTarget) {
+		return resolveDataSourceId(notion, auth, explicitTarget);
+	}
+
+	const parent = objectValue(page.parent);
+	const dataSourceId = stringValue(parent?.data_source_id);
+	if (dataSourceId) {
+		return dataSourceId;
+	}
+
+	const databaseId = stringValue(parent?.database_id);
+	if (databaseId) {
+		return resolveDataSourceId(notion, auth, databaseId);
+	}
+
+	return undefined;
+}
+
+async function ensureIssueTrackerAgentSchema(
+	notion: NotionClientLike,
+	auth: string,
+	dataSourceId: string,
+): Promise<void> {
+	const dataSource = await notion.dataSources.retrieve({
+		auth,
+		data_source_id: dataSourceId,
+	});
+	const properties = objectValue(objectValue(dataSource)?.properties) ?? {};
+	const missingProperties: Record<string, unknown> = {};
+
+	for (const [name, config] of Object.entries({
+		"Agent Status": { rich_text: {} },
+		"Agent Assignee": { rich_text: {} },
+		"Agent Run ID": { rich_text: {} },
+		"Agent Summary": { rich_text: {} },
+		"Agent PR URL": { url: {} },
+		"Agent Last Run At": { date: {} },
+	})) {
+		if (!properties[name]) {
+			missingProperties[name] = config;
+		}
+	}
+
+	if (Object.keys(missingProperties).length > 0) {
+		await notion.dataSources.update({
+			auth,
+			data_source_id: dataSourceId,
+			properties: missingProperties,
+		});
+	}
+}
+
+function defaultAgentScopeMarkdown(payload: IssueTrackerAgentPayload): string {
+	const properties = summarizeNotionProperties(payload.properties);
+	return [
+		`# ${payload.title}`,
+		"",
+		"## Requested Agent",
+		"",
+		payload.agent,
+		"",
+		"## Scope",
+		"",
+		"- Reproduce and inspect the task context before editing code.",
+		"- Identify the smallest repo change that addresses the issue.",
+		"- Run the relevant type checks, tests, or local verification commands.",
+		"- Open a GitHub pull request with the implementation and verification notes.",
+		"",
+		"## Notion Task",
+		"",
+		`- Page: ${payload.url ?? payload.pageId}`,
+		...Object.entries(properties).map(([name, value]) => `- ${name}: ${value}`),
+	].join("\n");
+}
+
+function normalizeAgentResultFiles(
+	payload: IssueTrackerAgentPayload,
+	scopeMarkdown: string,
+	runnerResult: AgentRunnerResult,
+): Array<{ path: string; content: string }> {
+	const files = (runnerResult.files ?? [])
+		.map((file) => ({
+			path: file.path?.trim() ?? "",
+			content: file.content ?? "",
+		}))
+		.filter((file) => file.path && file.content);
+
+	if (files.length > 0) {
+		return files;
+	}
+
+	return [
+		{
+			path: `docs/agent-scopes/${slugifyForBranch(payload.title)}-${payload.pageId.replace(/-/g, "").slice(0, 8)}.md`,
+			content: `${scopeMarkdown.trimEnd()}\n`,
+		},
+	];
+}
+
+async function githubApiRequest<T>(
+	token: string,
+	method: string,
+	path: string,
+	body?: unknown,
+): Promise<T> {
+	const response = await fetch(`https://api.github.com${path}`, {
+		method,
+		headers: {
+			...githubHeaders(token),
+			...(body ? { "Content-Type": "application/json" } : {}),
+		},
+		body: body ? JSON.stringify(body) : undefined,
+	});
+	await assertOk(response, `GitHub ${method} ${path}`);
+	return (await response.json()) as T;
+}
+
+async function githubApiRequestOptional<T>(
+	token: string,
+	method: string,
+	path: string,
+	body?: unknown,
+): Promise<T | undefined> {
+	const response = await fetch(`https://api.github.com${path}`, {
+		method,
+		headers: {
+			...githubHeaders(token),
+			...(body ? { "Content-Type": "application/json" } : {}),
+		},
+		body: body ? JSON.stringify(body) : undefined,
+	});
+	if (response.status === 404) {
+		return undefined;
+	}
+	await assertOk(response, `GitHub ${method} ${path}`);
+	return (await response.json()) as T;
+}
+
+function issueTrackerNotionAuth(): string {
+	return requireAnyEnv("ISSUE_TRACKER_NOTION_API_TOKEN", "NOTION_API_TOKEN");
+}
+
+function issueTrackerAgentPropertyName(): string {
+	return (
+		process.env.ISSUE_TRACKER_AGENT_PROPERTY ??
+		ISSUE_TRACKER_AGENT_PROPERTY_DEFAULT
+	);
+}
+
+function issueTrackerDispatchAgents(): Set<string> {
+	return new Set(
+		parseCsv(
+			process.env.ISSUE_TRACKER_AGENT_VALUES ??
+				ISSUE_TRACKER_AGENT_VALUES_DEFAULT,
+		).map((value) => value.toLowerCase()),
+	);
+}
+
+function openAICodeModel(): string {
+	return process.env.OPENAI_CODE_MODEL ?? OPENAI_CODE_MODEL_DEFAULT;
+}
+
+function openAICodeReasoningEffort(): string {
+	return (
+		process.env.OPENAI_CODE_REASONING_EFFORT ??
+		OPENAI_CODE_REASONING_EFFORT_DEFAULT
+	);
+}
+
+function actionQueueGithubOwner(): string {
+	return process.env.ACTION_QUEUE_GITHUB_OWNER ?? startupDocsOwner();
+}
+
+function actionQueueGithubRepo(): string {
+	return process.env.ACTION_QUEUE_GITHUB_REPO ?? startupDocsRepo();
+}
+
+function actionQueueGithubBaseBranch(): string {
+	return (
+		process.env.ACTION_QUEUE_GITHUB_BASE_BRANCH ??
+		process.env.STARTUP_DOCS_GITHUB_BRANCH ??
+		ACTION_QUEUE_BRANCH_DEFAULT
+	);
+}
+
+function actionQueueGithubToken(): string {
+	return requireOneOfEnv(
+		"ACTION_QUEUE_GITHUB_TOKEN",
+		"STARTUP_DOCS_GITHUB_TOKEN",
+		"GITHUB_TOKEN",
+	);
+}
+
+function notionPageTitle(properties: Record<string, unknown>): string {
+	for (const property of Object.values(properties)) {
+		const title = arrayValue(objectValue(property)?.title)
+			.map((item) => stringValue(objectValue(item)?.plain_text))
+			.join("");
+		if (title) {
+			return title;
+		}
+	}
+
+	return "";
+}
+
+function notionPropertyLabel(property: unknown): string {
+	const value = objectValue(property);
+	const select = objectValue(value?.select);
+	if (select) {
+		return stringValue(select.name);
+	}
+
+	const status = objectValue(value?.status);
+	if (status) {
+		return stringValue(status.name);
+	}
+
+	const multiSelect = arrayValue(value?.multi_select)
+		.map((item) => stringValue(objectValue(item)?.name))
+		.filter(Boolean)
+		.join(", ");
+	if (multiSelect) {
+		return multiSelect;
+	}
+
+	return richTextPropertyValue(property);
+}
+
+function notionPropertyUrl(property: unknown): string {
+	return stringValue(objectValue(property)?.url);
+}
+
+function summarizeNotionProperties(
+	properties: Record<string, unknown>,
+): Record<string, string> {
+	const summary: Record<string, string> = {};
+	for (const [name, property] of Object.entries(properties)) {
+		const label = notionPropertyLabel(property);
+		if (label) {
+			summary[name] = label;
+			continue;
+		}
+
+		const value = objectValue(property);
+		const number = numberValue(value?.number);
+		if (number !== undefined) {
+			summary[name] = String(number);
+			continue;
+		}
+
+		const date = objectValue(value?.date);
+		const start = stringValue(date?.start);
+		if (start) {
+			summary[name] = start;
+			continue;
+		}
+
+		if (typeof value?.checkbox === "boolean") {
+			summary[name] = String(value.checkbox);
+		}
+	}
+
+	return summary;
+}
+
+function verifyOptionalSharedSecret(
+	headers: Record<string, string>,
+	envName: string,
+): void {
+	const secret = process.env[envName];
+	if (!secret) {
+		return;
+	}
+
+	const actual = getHeader(headers, "x-shape-machine-secret");
+	if (!actual || !timingSafeEqual(actual, secret)) {
+		throw new WebhookVerificationError("Invalid Issue Tracker webhook secret");
+	}
+}
+
+function slugifyForBranch(value: string): string {
+	return (
+		value
+			.toLowerCase()
+			.replace(/[^a-z0-9]+/g, "-")
+			.replace(/^-+|-+$/g, "")
+			.slice(0, 60) || "task"
+	);
+}
+
 async function githubRequest<T>(
 	method: string,
 	path: string,
@@ -1673,7 +2574,7 @@ async function githubRequest<T>(
 	const response = await fetch(`https://api.github.com${path}`, {
 		method,
 		headers: {
-			...githubHeaders(requireEnv("GITHUB_TOKEN")),
+			...githubHeaders(startupDocsGithubToken()),
 			...(body ? { "Content-Type": "application/json" } : {}),
 		},
 		body: body ? JSON.stringify(body) : undefined,
@@ -1690,7 +2591,7 @@ async function githubRequestOptional<T>(
 	const response = await fetch(`https://api.github.com${path}`, {
 		method,
 		headers: {
-			...githubHeaders(requireEnv("GITHUB_TOKEN")),
+			...githubHeaders(startupDocsGithubToken()),
 			...(body ? { "Content-Type": "application/json" } : {}),
 		},
 		body: body ? JSON.stringify(body) : undefined,
@@ -3299,23 +4200,14 @@ worker.sync("granolaNotesBackfill", {
 	database: granolaNotes,
 	mode: "replace",
 	schedule: "manual",
-	execute: async (state: GranolaBackfillState | undefined, { notion }) => {
+	execute: async (state: GranolaBackfillState | undefined) => {
 		const token = requireEnv("GRANOLA_API_KEY");
 		const includeTranscript = process.env.GRANOLA_INCLUDE_TRANSCRIPT === "true";
-		const notionClient = notion as unknown as NotionClientLike;
-		const dataSourceId = await resolveDataSourceId(
-			notionClient,
-			requireEnv("NOTION_API_TOKEN"),
-			granolaNotionTargetId(),
-		);
-		const schema = await ensureGranolaNotionSchema(notionClient, dataSourceId);
-
 		const page = await fetchGranolaNotesPage(token, { cursor: state?.cursor });
 		const notes = await fetchGranolaNotes(page.notes, token, includeTranscript);
-		await upsertGranolaNotePages(notionClient, dataSourceId, notes, schema);
 
 		return {
-			changes: [],
+			changes: notes.map(granolaNoteChange),
 			hasMore: page.hasMore,
 			nextState:
 				page.hasMore && page.cursor ? { cursor: page.cursor } : undefined,
@@ -3327,19 +4219,11 @@ worker.sync("granolaNotesDelta", {
 	database: granolaNotes,
 	mode: "incremental",
 	schedule: "5m",
-	execute: async (state: GranolaDeltaState | undefined, { notion }) => {
+	execute: async (state: GranolaDeltaState | undefined) => {
 		const token = requireEnv("GRANOLA_API_KEY");
 		const includeTranscript = process.env.GRANOLA_INCLUDE_TRANSCRIPT === "true";
 		const updatedAfter =
 			state?.updatedAfter ?? bufferedGranolaDeltaCursor(new Date());
-		const notionClient = notion as unknown as NotionClientLike;
-		const dataSourceId = await resolveDataSourceId(
-			notionClient,
-			requireEnv("NOTION_API_TOKEN"),
-			granolaNotionTargetId(),
-		);
-		const schema = await ensureGranolaNotionSchema(notionClient, dataSourceId);
-
 		const page = await fetchGranolaNotesPage(token, {
 			updatedAfter,
 			cursor: state?.cursor,
@@ -3349,10 +4233,9 @@ worker.sync("granolaNotesDelta", {
 			state?.cycleMaxUpdatedAt,
 			...notes.map((note) => note.updated_at),
 		);
-		await upsertGranolaNotePages(notionClient, dataSourceId, notes, schema);
 
 		return {
-			changes: [],
+			changes: notes.map(granolaNoteChange),
 			hasMore: page.hasMore,
 			nextState:
 				page.hasMore && page.cursor
@@ -5147,142 +6030,6 @@ async function fetchGranolaNote(
 	);
 }
 
-type GranolaNotionSchema = {
-	titleProperty: string;
-};
-
-function granolaNotionTargetId(): string {
-	return (
-		process.env.GRANOLA_NOTION_DATA_SOURCE_ID ??
-		process.env.GRANOLA_NOTION_DATABASE_ID ??
-		GRANOLA_NOTION_DATA_SOURCE_ID_DEFAULT
-	);
-}
-
-async function ensureGranolaNotionSchema(
-	notion: NotionClientLike,
-	dataSourceId: string,
-): Promise<GranolaNotionSchema> {
-	const dataSource = await notion.dataSources.retrieve({
-		data_source_id: dataSourceId,
-	});
-	const properties = objectValue(objectValue(dataSource)?.properties) ?? {};
-	const titleProperty =
-		Object.entries(properties).find(
-			([, property]) => objectValue(property)?.type === "title",
-		)?.[0] ?? "Note";
-	const missingProperties: Record<string, unknown> = {};
-
-	for (const [name, config] of Object.entries({
-		"Granola Note ID": { rich_text: {} },
-		Owner: { rich_text: {} },
-		Attendees: { rich_text: {} },
-		"Meeting Time": { date: {} },
-		Summary: { rich_text: {} },
-		"Action Items": { rich_text: {} },
-		"Updated Time": { date: {} },
-		"Web URL": { url: {} },
-	})) {
-		if (!properties[name]) {
-			missingProperties[name] = config;
-		}
-	}
-
-	if (Object.keys(missingProperties).length > 0) {
-		await notion.dataSources.update({
-			data_source_id: dataSourceId,
-			properties: missingProperties,
-		});
-	}
-
-	return { titleProperty };
-}
-
-async function upsertGranolaNotePages(
-	notion: NotionClientLike,
-	dataSourceId: string,
-	notes: GranolaNote[],
-	schema: GranolaNotionSchema,
-): Promise<void> {
-	for (const note of notes) {
-		await upsertGranolaNotePage(notion, dataSourceId, note, schema);
-	}
-}
-
-async function upsertGranolaNotePage(
-	notion: NotionClientLike,
-	dataSourceId: string,
-	note: GranolaNote,
-	schema: GranolaNotionSchema,
-): Promise<void> {
-	const { properties, markdown } = toNotionGranolaPage(note, schema);
-	const existing = await notion.dataSources.query({
-		data_source_id: dataSourceId,
-		page_size: 1,
-		result_type: "page",
-		filter: {
-			property: "Granola Note ID",
-			rich_text: {
-				equals: note.id,
-			},
-		},
-	});
-	const page = existing.results.find((result) => result.object === "page");
-
-	if (page) {
-		await notion.pages.update({
-			page_id: page.id,
-			properties,
-		});
-		await notion.pages.updateMarkdown({
-			page_id: page.id,
-			type: "replace_content",
-			replace_content: {
-				new_str: markdown,
-				allow_deleting_content: true,
-			},
-		});
-		return;
-	}
-
-	await notion.pages.create({
-		parent: {
-			type: "data_source_id",
-			data_source_id: dataSourceId,
-		},
-		properties,
-		markdown,
-	});
-}
-
-function toNotionGranolaPage(
-	note: GranolaNote,
-	schema: GranolaNotionSchema,
-): { properties: Record<string, unknown>; markdown: string } {
-	const summary = note.summary_markdown ?? note.summary_text ?? "";
-	const actionItems = extractActionItems(summary);
-	const attendees = formatPeople(note.attendees ?? note.calendar_event?.invitees);
-	const meetingTime =
-		note.calendar_event?.scheduled_start_time ?? note.created_at;
-
-	return {
-		properties: {
-			[schema.titleProperty]: notionTitle(
-				note.title ?? `Granola note ${note.id}`,
-			),
-			"Granola Note ID": notionRichText(note.id),
-			Owner: notionRichText(formatPerson(note.owner)),
-			Attendees: notionRichText(attendees),
-			"Meeting Time": notionDate(meetingTime),
-			Summary: notionRichText(summary),
-			"Action Items": notionRichText(actionItems),
-			"Updated Time": notionDate(note.updated_at),
-			"Web URL": notionUrl(note.web_url ?? undefined),
-		},
-		markdown: granolaNoteMarkdown(note, actionItems),
-	};
-}
-
 function granolaNoteChange(note: GranolaNote) {
 	const summary = note.summary_markdown ?? note.summary_text ?? "";
 	const actionItems = extractActionItems(summary);
@@ -5380,6 +6127,19 @@ function requireAnyEnv(primaryName: string, fallbackName: string): string {
 		);
 	}
 	return value;
+}
+
+function requireOneOfEnv(...names: string[]): string {
+	for (const name of names) {
+		const value = process.env[name];
+		if (value) {
+			return value;
+		}
+	}
+
+	throw new Error(
+		`${names.join(", ")}: one of these environment variables is required. Set it locally in .env or remotely with ntn workers env set ${names[0]}=...`,
+	);
 }
 
 function normalizeNotionId(idOrUrl: string): string {

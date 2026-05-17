@@ -4,7 +4,8 @@
 	"private": true,
 	"scripts": {
 		"build": "tsc && node -e \"const fs=require('node:fs'); fs.rmSync('dist/images',{recursive:true,force:true}); fs.cpSync('src/images', 'dist/images', { recursive: true })\"",
-		"check": "tsc --noEmit"
+		"check": "tsc --noEmit",
+		"demo:check": "bash scripts/demo-check.sh"
 	},
 	"engines": {
 		"node": ">=22.0.0",
