@@ -26,6 +26,8 @@ Replace-mode syncs delete stale rows only after every page in the upstream datas
 ## Webhooks
 
 - `sentryIssueAlertWebhook`: receives Sentry issue-alert webhook deliveries, verifies `Sentry-Hook-Signature`, and upserts the issue into an existing Notion database.
+- `startupDocsGithubPushWebhook`: receives GitHub push deliveries for Startup Intros Markdown docs and updates the existing Notion Wiki pages.
+- `startupDocsNotionPageWebhook`: receives Notion Wiki page update deliveries and opens GitHub pull requests for mapped Markdown files.
 
 The webhook writes through the Notion API into the same configured Sentry Notion data source used by `sentryIssuesSync`. Keep `sentryIssuesSync` enabled as a backfill/recovery path for missed webhook deliveries.
 
@@ -44,6 +46,13 @@ GITHUB_CONTEXT_COMMENTS_LIMIT=10
 GITHUB_CONTEXT_FILES_LIMIT=50
 GITHUB_CONTEXT_COMMITS_LIMIT=20
 GITHUB_CONTEXT_REVIEWS_LIMIT=20
+
+STARTUP_DOCS_GITHUB_OWNER=StartupIntros
+STARTUP_DOCS_GITHUB_REPO=startupintros-nextjs
+STARTUP_DOCS_GITHUB_BRANCH=main
+STARTUP_DOCS_GITHUB_WEBHOOK_SECRET=
+STARTUP_DOCS_NOTION_API_TOKEN=
+STARTUP_DOCS_NOTION_DATA_SOURCE_ID=3633edae-28d3-8028-b316-000bc8522720
 
 NOTION_API_TOKEN=
 SENTRY_NOTION_API_TOKEN=
@@ -73,6 +82,8 @@ This worker repo defaults to `modusopsai/notion-hackathon` in source. Set `GITHU
 `GITHUB_NOTION_DATA_SOURCE_ID` points at the existing Notion data source that should receive GitHub issues and pull requests. The default target is the `GitHub DB` data source, `3623edae28d380cdafa7000b11385255`, inside the `Data Sources` database. `GITHUB_NOTION_API_TOKEN` is preferred for deployed GitHub Notion writes; the worker falls back to `NOTION_API_TOKEN` locally. `GITHUB_WEBHOOK_SECRET` must match the secret configured on the GitHub webhook.
 
 Direct GitHub Notion writes enrich each issue/PR page with the full description, recent comments, and, for pull requests, reviews, changed files, and commits. `GITHUB_CONTEXT_COMMENTS_LIMIT`, `GITHUB_CONTEXT_FILES_LIMIT`, `GITHUB_CONTEXT_COMMITS_LIMIT`, and `GITHUB_CONTEXT_REVIEWS_LIMIT` bound the extra GitHub API reads and page body size. Set a limit to `0` to skip that section.
+
+The Startup Intros docs sync watches only `README.md`, `docs/README.md`, `docs/product/**`, `docs/architecture/adr/**`, and `docs/runbooks/**` in `StartupIntros/startupintros-nextjs`. GitHub-to-Notion updates write directly to the existing Wiki data source. Notion-to-GitHub updates never push to `main`; they create a branch and pull request for review. `STARTUP_DOCS_GITHUB_WEBHOOK_SECRET` can differ from `GITHUB_WEBHOOK_SECRET`, and `STARTUP_DOCS_NOTION_API_TOKEN` can differ from `NOTION_API_TOKEN` when deployed. `GITHUB_TOKEN` needs contents read/write and pull-request write access for the Startup Intros repository.
 
 `SENTRY_NOTION_API_TOKEN` is required for deployed webhook writes to Notion. The worker also accepts `NOTION_API_TOKEN` locally for non-tool capabilities or local Notion API checks that use an internal integration token. Create one at https://www.notion.so/profile/integrations/internal, grant it access to the relevant pages/databases, then paste the token into `.env`.
 
@@ -106,6 +117,9 @@ ntn workers sync trigger githubActivitySync --preview
 ntn workers sync trigger githubIssuesBackfill --preview
 ntn workers sync trigger githubIssuesDelta --preview
 ntn workers exec githubIssuesNotionBackfill --local -d '{"dryRun":true,"page":null,"updatedSince":null,"includeContext":true}'
+ntn workers exec startupDocsGithubToNotion --local -d '{"dryRun":true,"paths":null,"ref":null}'
+ntn workers exec startupDocsGithubToNotion --local -d '{"dryRun":false,"paths":null,"ref":null}'
+ntn workers exec startupDocsNotionToGithub --local -d '{"pageId":"<notion-page-id>","dryRun":true}'
 ntn workers sync trigger sentryIssuesSync --preview
 ntn workers sync trigger granolaNotesBackfill
 ntn workers sync trigger granolaNotesDelta
@@ -133,6 +147,17 @@ ntn workers sync trigger slackMessagesDelta --preview
 7. Send a GitHub test delivery or update an issue/PR; repeated deliveries update the same Notion page by `GitHub Item ID`.
 
 If you change sync state handling or need a full refresh, reset a sync before triggering it:
+
+## Startup docs two-way sync setup
+
+1. Set `GITHUB_TOKEN` with contents and pull request access for `StartupIntros/startupintros-nextjs`.
+2. Set `STARTUP_DOCS_NOTION_API_TOKEN` or `NOTION_API_TOKEN` and share the Wiki database with that integration.
+3. Run `ntn workers exec startupDocsGithubToNotion --local -d '{"dryRun":true,"paths":null,"ref":null}'` to preview the Markdown files that will sync.
+4. Run `ntn workers exec startupDocsGithubToNotion --local -d '{"dryRun":false,"paths":null,"ref":null}'` once to seed `GitHub Path`, `GitHub SHA`, and sync metadata on the existing Wiki pages.
+5. Deploy with `ntn workers deploy`, then run `ntn workers webhooks list`.
+6. In GitHub, create a repository webhook for `push` events using the `startupDocsGithubPushWebhook` URL and `STARTUP_DOCS_GITHUB_WEBHOOK_SECRET`.
+7. In Notion, subscribe the integration/webhook to Wiki page content updates using the `startupDocsNotionPageWebhook` URL.
+8. Review Notion-originated Markdown changes in GitHub PRs before merging.
 
 ```bash
 ntn workers sync state reset githubIssuesBackfill

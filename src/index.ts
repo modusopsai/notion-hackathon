@@ -7,7 +7,7 @@ import {
 import * as Builder from "@notionhq/workers/builder";
 import * as Schema from "@notionhq/workers/schema";
 import { j } from "@notionhq/workers/schema-builder";
-import type { TextValue } from "@notionhq/workers/types";
+import type { JSONValue, TextValue } from "@notionhq/workers/types";
 
 const worker = new Worker();
 export default worker;
@@ -23,6 +23,12 @@ const GITHUB_CONTEXT_COMMENTS_LIMIT = 10;
 const GITHUB_CONTEXT_FILES_LIMIT = 50;
 const GITHUB_CONTEXT_COMMITS_LIMIT = 20;
 const GITHUB_CONTEXT_REVIEWS_LIMIT = 20;
+const STARTUP_DOCS_OWNER_DEFAULT = "StartupIntros";
+const STARTUP_DOCS_REPO_DEFAULT = "startupintros-nextjs";
+const STARTUP_DOCS_BRANCH_DEFAULT = "main";
+const STARTUP_DOCS_NOTION_DATA_SOURCE_ID_DEFAULT =
+	"3633edae-28d3-8028-b316-000bc8522720";
+const STARTUP_DOCS_RELATED_PROPERTY = "Related Wiki Pages";
 const GRANOLA_PAGE_SIZE = 30;
 const GRANOLA_DELTA_BUFFER_MS = 60_000;
 const GRANOLA_NOTION_DATA_SOURCE_ID_DEFAULT =
@@ -177,6 +183,107 @@ worker.tool("checkNotionConnection", {
 	},
 });
 
+worker.tool<StartupDocsGithubToNotionInput>("startupDocsGithubToNotion", {
+	title: "Sync Startup Docs From GitHub to Notion",
+	description:
+		"Backfill or update Startup Intros Markdown documentation from GitHub into the existing Wiki data source.",
+	schema: j.object({
+		dryRun: j
+			.boolean()
+			.nullable()
+			.describe("When true, list matching Markdown files without writing."),
+		paths: j
+			.string()
+			.nullable()
+			.describe(
+				"Optional comma-separated repo paths to sync. Defaults to every configured documentation Markdown path.",
+			),
+		ref: j
+			.string()
+			.nullable()
+			.describe("Optional Git ref or branch. Defaults to STARTUP_DOCS_BRANCH or main."),
+	}),
+	execute: async (input, { notion }) => {
+		const dryRun = input.dryRun ?? false;
+		const ref = input.ref ?? startupDocsBranch();
+		const paths =
+			parseCsv(input.paths ?? "").length > 0
+				? parseCsv(input.paths ?? "").filter(isStartupDocsPath)
+				: await listStartupDocsMarkdownPaths(ref);
+
+		if (dryRun) {
+			return {
+				dryRun,
+				ref,
+				count: paths.length,
+				upserted: 0,
+				paths,
+			};
+		}
+
+		const notionClient = notion as unknown as NotionClientLike;
+		const auth = startupDocsNotionAuth();
+		const dataSourceId = await resolveDataSourceId(
+			notionClient,
+			auth,
+			startupDocsNotionTargetId(),
+		);
+		const schema = await ensureStartupDocsNotionSchema(
+			notionClient,
+			auth,
+			dataSourceId,
+		);
+
+		let upserted = 0;
+		for (const path of paths) {
+			const file = await fetchStartupDocsGithubFile(path, ref);
+			await upsertStartupDocsNotionPage(
+				notionClient,
+				auth,
+				dataSourceId,
+				schema,
+				file,
+				"manual-github-backfill",
+			);
+			upserted += 1;
+		}
+
+		return {
+			dryRun,
+			ref,
+			count: paths.length,
+			upserted,
+			paths,
+		};
+	},
+});
+
+worker.tool<StartupDocsNotionToGithubInput>("startupDocsNotionToGithub", {
+	title: "Open Startup Docs PR From Notion Page",
+	description:
+		"Create a GitHub pull request from one uploaded Startup Intros Wiki page back to its Markdown file.",
+	schema: j.object({
+		pageId: j.string().describe("Notion page ID to export back to GitHub."),
+		dryRun: j
+			.boolean()
+			.nullable()
+			.describe("When true, retrieve and map the page without creating a branch or PR."),
+	}),
+	execute: async (input, { notion }) => {
+		const notionClient = notion as unknown as NotionClientLike;
+		const auth = startupDocsNotionAuth();
+		const result = await syncStartupDocsNotionPageToGithub(
+			notionClient,
+			auth,
+			input.pageId,
+			input.dryRun ?? false,
+			"manual-notion-export",
+		);
+
+		return result;
+	},
+});
+
 worker.tool<GithubIssuesNotionBackfillInput>("githubIssuesNotionBackfill", {
 	title: "Backfill GitHub Issues to Notion",
 	description:
@@ -292,6 +399,64 @@ type GithubIssuesNotionBackfillInput = {
 	page: number | null;
 	updatedSince: string | null;
 	includeContext: boolean | null;
+};
+
+type StartupDocsGithubToNotionInput = {
+	dryRun: boolean | null;
+	paths: string | null;
+	ref: string | null;
+};
+
+type StartupDocsNotionToGithubInput = {
+	pageId: string;
+	dryRun: boolean | null;
+};
+
+type StartupDocsGithubFile = {
+	path: string;
+	sha: string;
+	htmlUrl: string;
+	content: string;
+	ref: string;
+};
+
+type GitHubPushWebhookPayload = {
+	ref?: string;
+	after?: string;
+	deleted?: boolean;
+	repository?: {
+		name?: string;
+		full_name?: string;
+		default_branch?: string;
+		owner?: {
+			name?: string;
+			login?: string;
+		};
+	};
+	commits?: Array<{
+		added?: string[];
+		modified?: string[];
+		removed?: string[];
+	}>;
+};
+
+type NotionPageWebhookPayload = {
+	type?: string;
+	entity?: {
+		id?: string;
+		type?: string;
+	};
+	data?: {
+		id?: string;
+		parent?: {
+			data_source_id?: string;
+			database_id?: string;
+		};
+		updated_blocks?: Array<{
+			id?: string;
+			type?: string;
+		}>;
+	};
 };
 
 type SentrySyncState = {
@@ -748,6 +913,101 @@ worker.webhook("githubIssuesWebhook", {
 	},
 });
 
+worker.webhook("startupDocsGithubPushWebhook", {
+	title: "Startup Docs GitHub Push Webhook",
+	description:
+		"Receives verified GitHub push deliveries and syncs changed Markdown docs into the Startup Intros Notion Wiki.",
+	execute: async (events, { notion }) => {
+		const secret = startupDocsGithubWebhookSecret();
+		const notionClient = notion as unknown as NotionClientLike;
+		const auth = startupDocsNotionAuth();
+		const dataSourceId = await resolveDataSourceId(
+			notionClient,
+			auth,
+			startupDocsNotionTargetId(),
+		);
+		const schema = await ensureStartupDocsNotionSchema(
+			notionClient,
+			auth,
+			dataSourceId,
+		);
+
+		for (const event of events) {
+			verifyGithubWebhookSignature(event.rawBody, event.headers, secret);
+			const payload = objectValue(event.body) as GitHubPushWebhookPayload | undefined;
+			if (!payload || payload.deleted) {
+				continue;
+			}
+			if (!isStartupDocsRepositoryPayload(payload)) {
+				console.log(
+					`Ignoring Startup docs push ${event.deliveryId}: repository does not match configured docs repo.`,
+				);
+				continue;
+			}
+
+			const ref = githubRefName(payload.ref) ?? startupDocsBranch();
+			const changed = startupDocsChangedPaths(payload);
+			for (const path of changed.upserts) {
+				const file = await fetchStartupDocsGithubFile(path, ref);
+				await upsertStartupDocsNotionPage(
+					notionClient,
+					auth,
+					dataSourceId,
+					schema,
+					file,
+					"github-push",
+				);
+			}
+
+			for (const path of changed.removed) {
+				await markStartupDocsNotionPageArchived(
+					notionClient,
+					auth,
+					dataSourceId,
+					schema,
+					path,
+				);
+			}
+		}
+	},
+});
+
+worker.webhook("startupDocsNotionPageWebhook", {
+	title: "Startup Docs Notion Page Webhook",
+	description:
+		"Receives Notion Wiki page update deliveries and opens GitHub pull requests for Markdown doc edits.",
+	execute: async (events, { notion }) => {
+		const notionClient = notion as unknown as NotionClientLike;
+		const auth = startupDocsNotionAuth();
+		const dataSourceId = await resolveDataSourceId(
+			notionClient,
+			auth,
+			startupDocsNotionTargetId(),
+		);
+		await ensureStartupDocsNotionSchema(notionClient, auth, dataSourceId);
+
+		for (const event of events) {
+			const pageIds = notionWebhookPageIds(event.body as NotionPageWebhookPayload);
+			if (pageIds.length === 0) {
+				console.log(
+					`Ignoring Notion webhook ${event.deliveryId}: no page ID found.`,
+				);
+				continue;
+			}
+
+			for (const pageId of pageIds) {
+				await syncStartupDocsNotionPageToGithub(
+					notionClient,
+					auth,
+					pageId,
+					false,
+					"notion-webhook",
+				);
+			}
+		}
+	},
+});
+
 worker.sync("slackMessagesBackfill", {
 	database: slackMessages,
 	mode: "replace",
@@ -836,6 +1096,616 @@ worker.sync("slackMessagesDelta", {
 		};
 	},
 });
+
+type StartupDocsNotionSchema = {
+	titleProperty: string;
+};
+
+function startupDocsOwner(): string {
+	return process.env.STARTUP_DOCS_GITHUB_OWNER ?? STARTUP_DOCS_OWNER_DEFAULT;
+}
+
+function startupDocsRepo(): string {
+	return process.env.STARTUP_DOCS_GITHUB_REPO ?? STARTUP_DOCS_REPO_DEFAULT;
+}
+
+function startupDocsBranch(): string {
+	return process.env.STARTUP_DOCS_GITHUB_BRANCH ?? STARTUP_DOCS_BRANCH_DEFAULT;
+}
+
+function startupDocsNotionTargetId(): string {
+	return (
+		process.env.STARTUP_DOCS_NOTION_DATA_SOURCE_ID ??
+		process.env.STARTUP_DOCS_NOTION_DATABASE_ID ??
+		STARTUP_DOCS_NOTION_DATA_SOURCE_ID_DEFAULT
+	);
+}
+
+function startupDocsNotionAuth(): string {
+	return requireAnyEnv("STARTUP_DOCS_NOTION_API_TOKEN", "NOTION_API_TOKEN");
+}
+
+function startupDocsGithubWebhookSecret(): string {
+	return requireAnyEnv("STARTUP_DOCS_GITHUB_WEBHOOK_SECRET", "GITHUB_WEBHOOK_SECRET");
+}
+
+function isStartupDocsPath(path: string): boolean {
+	if (!path.endsWith(".md")) {
+		return false;
+	}
+
+	return (
+		path === "README.md" ||
+		path === "docs/README.md" ||
+		path.startsWith("docs/product/") ||
+		path.startsWith("docs/architecture/adr/") ||
+		path.startsWith("docs/runbooks/")
+	);
+}
+
+function startupDocsChangedPaths(payload: GitHubPushWebhookPayload): {
+	upserts: string[];
+	removed: string[];
+} {
+	const upserts = new Set<string>();
+	const removed = new Set<string>();
+
+	for (const commit of payload.commits ?? []) {
+		for (const path of [...(commit.added ?? []), ...(commit.modified ?? [])]) {
+			if (isStartupDocsPath(path)) {
+				upserts.add(path);
+				removed.delete(path);
+			}
+		}
+		for (const path of commit.removed ?? []) {
+			if (isStartupDocsPath(path)) {
+				removed.add(path);
+				upserts.delete(path);
+			}
+		}
+	}
+
+	return {
+		upserts: [...upserts].sort(),
+		removed: [...removed].sort(),
+	};
+}
+
+function isStartupDocsRepositoryPayload(payload: GitHubPushWebhookPayload): boolean {
+	const expected = `${startupDocsOwner()}/${startupDocsRepo()}`.toLowerCase();
+	const fullName = payload.repository?.full_name?.toLowerCase();
+	return !fullName || fullName === expected;
+}
+
+function githubRefName(ref: string | undefined): string | undefined {
+	return ref?.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
+}
+
+async function ensureStartupDocsNotionSchema(
+	notion: NotionClientLike,
+	auth: string,
+	dataSourceId: string,
+): Promise<StartupDocsNotionSchema> {
+	const dataSource = await notion.dataSources.retrieve({
+		auth,
+		data_source_id: dataSourceId,
+	});
+	const properties = objectValue(objectValue(dataSource)?.properties) ?? {};
+	const titleProperty =
+		Object.entries(properties).find(
+			([, property]) => objectValue(property)?.type === "title",
+		)?.[0] ?? "Title";
+	const missingProperties: Record<string, unknown> = {};
+
+	for (const [name, config] of Object.entries({
+		"GitHub Path": { rich_text: {} },
+		"GitHub SHA": { rich_text: {} },
+		"GitHub URL": { url: {} },
+		"Last Synced At": { date: {} },
+		"Sync Source": { rich_text: {} },
+		"Sync Status": { rich_text: {} },
+		"Notion Content Hash": { rich_text: {} },
+	})) {
+		if (!properties[name]) {
+			missingProperties[name] = config;
+		}
+	}
+
+	if (!properties[STARTUP_DOCS_RELATED_PROPERTY]) {
+		missingProperties[STARTUP_DOCS_RELATED_PROPERTY] = {
+			relation: {
+				data_source_id: dataSourceId,
+				type: "single_property",
+				single_property: {},
+			},
+		};
+	}
+
+	if (Object.keys(missingProperties).length > 0) {
+		await notion.dataSources.update({
+			auth,
+			data_source_id: dataSourceId,
+			properties: missingProperties,
+		});
+	}
+
+	return { titleProperty };
+}
+
+async function listStartupDocsMarkdownPaths(ref: string): Promise<string[]> {
+	const tree = await githubRequest<{
+		tree?: Array<{ path?: string; type?: string }>;
+	}>(
+		"GET",
+		`/repos/${encodeURIComponent(startupDocsOwner())}/${encodeURIComponent(startupDocsRepo())}/git/trees/${encodeURIComponent(ref)}?recursive=1`,
+	);
+
+	return (tree.tree ?? [])
+		.filter((item) => item.type === "blob" && item.path && isStartupDocsPath(item.path))
+		.map((item) => item.path as string)
+		.sort();
+}
+
+async function fetchStartupDocsGithubFile(
+	path: string,
+	ref: string,
+): Promise<StartupDocsGithubFile> {
+	const file = await githubRequest<{
+		sha?: string;
+		content?: string;
+		encoding?: string;
+		html_url?: string;
+		path?: string;
+	}>(
+		"GET",
+		`/repos/${encodeURIComponent(startupDocsOwner())}/${encodeURIComponent(startupDocsRepo())}/contents/${encodeURIComponentPath(path)}?ref=${encodeURIComponent(ref)}`,
+	);
+	if (file.encoding !== "base64" || !file.content || !file.sha) {
+		throw new Error(`GitHub file ${path} did not return base64 content and sha.`);
+	}
+
+	return {
+		path,
+		sha: file.sha,
+		htmlUrl:
+			file.html_url ??
+			`https://github.com/${startupDocsOwner()}/${startupDocsRepo()}/blob/${ref}/${path}`,
+		content: Buffer.from(file.content, "base64").toString("utf8"),
+		ref,
+	};
+}
+
+async function upsertStartupDocsNotionPage(
+	notion: NotionClientLike,
+	auth: string,
+	dataSourceId: string,
+	schema: StartupDocsNotionSchema,
+	file: StartupDocsGithubFile,
+	source: string,
+): Promise<void> {
+	const markdown = startupDocsNotionMarkdown(file);
+	const existing = await findStartupDocsNotionPage(
+		notion,
+		auth,
+		dataSourceId,
+		schema,
+		file.path,
+		startupDocsTitleFromMarkdown(file.content, file.path),
+	);
+	const properties = startupDocsNotionProperties(file, schema, source, markdown);
+
+	if (existing) {
+		await notion.pages.update({
+			auth,
+			page_id: existing.id,
+			archived: false,
+			properties,
+		});
+		await notion.pages.updateMarkdown({
+			auth,
+			page_id: existing.id,
+			type: "replace_content",
+			replace_content: {
+				new_str: markdown,
+				allow_deleting_content: true,
+			},
+		});
+		return;
+	}
+
+	await notion.pages.create({
+		auth,
+		parent: {
+			type: "data_source_id",
+			data_source_id: dataSourceId,
+		},
+		properties,
+		markdown,
+	});
+}
+
+async function markStartupDocsNotionPageArchived(
+	notion: NotionClientLike,
+	auth: string,
+	dataSourceId: string,
+	schema: StartupDocsNotionSchema,
+	path: string,
+): Promise<void> {
+	const existing = await findStartupDocsNotionPage(
+		notion,
+		auth,
+		dataSourceId,
+		schema,
+		path,
+		undefined,
+	);
+	if (!existing) {
+		return;
+	}
+
+	await notion.pages.update({
+		auth,
+		page_id: existing.id,
+		properties: {
+			Status: { status: { name: "Archived" } },
+			"Sync Source": notionRichText("github-push"),
+			"Sync Status": notionRichText("Deleted in GitHub"),
+			"Last Synced At": notionDate(new Date().toISOString()),
+		},
+	});
+}
+
+async function findStartupDocsNotionPage(
+	notion: NotionClientLike,
+	auth: string,
+	dataSourceId: string,
+	schema: StartupDocsNotionSchema,
+	path: string,
+	title: string | undefined,
+): Promise<{ id: string; object: string } | undefined> {
+	const byPath = await notion.dataSources.query({
+		auth,
+		data_source_id: dataSourceId,
+		page_size: 1,
+		result_type: "page",
+		filter: {
+			property: "GitHub Path",
+			rich_text: {
+				equals: path,
+			},
+		},
+	});
+	const pathMatch = byPath.results.find((result) => result.object === "page");
+	if (pathMatch || !title) {
+		return pathMatch;
+	}
+
+	const byTitle = await notion.dataSources.query({
+		auth,
+		data_source_id: dataSourceId,
+		page_size: 1,
+		result_type: "page",
+		filter: {
+			property: schema.titleProperty,
+			title: {
+				equals: title,
+			},
+		},
+	});
+
+	return byTitle.results.find((result) => result.object === "page");
+}
+
+function startupDocsNotionProperties(
+	file: StartupDocsGithubFile,
+	schema: StartupDocsNotionSchema,
+	source: string,
+	markdown: string,
+): Record<string, unknown> {
+	const title = startupDocsTitleFromMarkdown(file.content, file.path);
+	const category = startupDocsCategory(file.path);
+	const now = new Date().toISOString();
+
+	return {
+		[schema.titleProperty]: notionTitle(title),
+		Category: { select: { name: category } },
+		Tags: {
+			multi_select: startupDocsTags(file.path).map((name) => ({ name })),
+		},
+		Status: { status: { name: "Published" } },
+		Priority: { select: { name: startupDocsPriority(file.path) } },
+		"Last Updated": notionDate(startupDocsLastUpdated(file.content) ?? now.slice(0, 10)),
+		"GitHub Path": notionRichText(file.path),
+		"GitHub SHA": notionRichText(file.sha),
+		"GitHub URL": notionUrl(file.htmlUrl),
+		"Last Synced At": notionDate(now),
+		"Sync Source": notionRichText(source),
+		"Sync Status": notionRichText("Synced from GitHub"),
+		"Notion Content Hash": notionRichText(hashContent(markdown)),
+	};
+}
+
+function startupDocsNotionMarkdown(file: StartupDocsGithubFile): string {
+	return [
+		`> Source path: ${file.path}`,
+		`> GitHub SHA: ${file.sha}`,
+		"",
+		file.content.trimEnd(),
+		"",
+	].join("\n");
+}
+
+function startupDocsTitleFromMarkdown(markdown: string, path: string): string {
+	const heading = /^#\s+(.+)$/m.exec(markdown);
+	if (heading) {
+		return stripMarkdownInline(heading[1]).slice(0, 180);
+	}
+
+	const segments = path.split("/");
+	return segments[segments.length - 1]
+		.replace(/\.md$/, "")
+		.replace(/[-_]/g, " ")
+		.replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function startupDocsCategory(path: string): string {
+	if (path.includes("/architecture/adr/")) {
+		return "Engineering";
+	}
+	if (path.includes("/runbooks/")) {
+		return "Operations";
+	}
+	return "Product";
+}
+
+function startupDocsTags(path: string): string[] {
+	const tags = new Set(["Documentation"]);
+	if (path.includes("/runbooks/")) {
+		tags.add("Guide");
+	} else if (path.includes("/decisions/") || path.includes("/adr/")) {
+		tags.add("Best Practice");
+	} else {
+		tags.add("Reference");
+	}
+	if (path.includes("onboarding")) {
+		tags.add("Onboarding");
+	}
+	return [...tags];
+}
+
+function startupDocsPriority(path: string): string {
+	return /(^README\.md$|^docs\/README\.md$|prd\.md$|design-doc\.md$|roadmap\.md$|qa-checklists\.md$|release-readiness\.md$|runbooks\/README\.md$)/.test(
+		path,
+	)
+		? "High"
+		: "Medium";
+}
+
+function startupDocsLastUpdated(markdown: string): string | undefined {
+	return /^>\s*\*\*Last Updated\*\*:\s*(\d{4}-\d{2}-\d{2})/im.exec(markdown)?.[1];
+}
+
+function stripMarkdownInline(value: string): string {
+	return value
+		.replace(/`([^`]+)`/g, "$1")
+		.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+		.replace(/[*_~]/g, "")
+		.trim();
+}
+
+function notionWebhookPageIds(payload: NotionPageWebhookPayload): string[] {
+	const ids = new Set<string>();
+	if (payload.entity?.type === "page" && payload.entity.id) {
+		ids.add(payload.entity.id);
+	}
+	if (payload.data?.id && payload.type?.includes("page")) {
+		ids.add(payload.data.id);
+	}
+	for (const block of payload.data?.updated_blocks ?? []) {
+		if (block.id && (!block.type || block.type === "page")) {
+			ids.add(block.id);
+		}
+	}
+	return [...ids];
+}
+
+async function syncStartupDocsNotionPageToGithub(
+	notion: NotionClientLike,
+	auth: string,
+	pageId: string,
+	dryRun: boolean,
+	source: string,
+): Promise<{ [key: string]: JSONValue }> {
+	const page = objectValue(
+		await notion.pages.retrieve({
+			auth,
+			page_id: pageId,
+		}),
+	);
+	const properties = objectValue(page?.properties) ?? {};
+	const path = richTextPropertyValue(properties["GitHub Path"]);
+	if (!path || !isStartupDocsPath(path)) {
+		return {
+			skipped: true,
+			reason: "Page is not mapped to a Startup Intros Markdown path.",
+			pageId,
+		};
+	}
+
+	const markdownResponse = objectValue(
+		await notion.pages.retrieveMarkdown({
+			auth,
+			page_id: pageId,
+		}),
+	);
+	const notionMarkdown = stringValue(markdownResponse?.markdown);
+	const currentHash = hashContent(notionMarkdown);
+	const storedHash = richTextPropertyValue(properties["Notion Content Hash"]);
+	if (storedHash && storedHash === currentHash) {
+		return {
+			skipped: true,
+			reason: "Notion content hash matches the last synced GitHub content.",
+			pageId,
+			path,
+		};
+	}
+
+	const content = cleanupNotionMarkdownForGithub(notionMarkdown, path);
+	if (dryRun) {
+		return {
+			dryRun,
+			pageId,
+			path,
+			characters: content.length,
+			source,
+		};
+	}
+
+	const pr = await createStartupDocsGithubPullRequest(path, content, pageId);
+	await notion.pages.update({
+		auth,
+		page_id: pageId,
+		properties: {
+			"Last Synced At": notionDate(new Date().toISOString()),
+			"Sync Source": notionRichText(source),
+			"Sync Status": notionRichText(`Opened PR ${pr.html_url ?? ""}`.trim()),
+		},
+	});
+
+	return {
+		dryRun,
+		pageId,
+		path,
+		pullRequestUrl: pr.html_url ?? null,
+	};
+}
+
+function cleanupNotionMarkdownForGithub(markdown: string, path: string): string {
+	const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+	while (
+		lines[0]?.includes(`Source path: ${path}`) ||
+		lines[0]?.startsWith("> GitHub SHA:") ||
+		lines[0]?.trim() === ""
+	) {
+		lines.shift();
+	}
+	return `${lines.join("\n").trimEnd()}\n`;
+}
+
+async function createStartupDocsGithubPullRequest(
+	path: string,
+	content: string,
+	pageId: string,
+): Promise<{ html_url?: string; number?: number }> {
+	const owner = startupDocsOwner();
+	const repo = startupDocsRepo();
+	const base = startupDocsBranch();
+	const baseRef = await githubRequest<{
+		object?: {
+			sha?: string;
+		};
+	}>(
+		"GET",
+		`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/heads/${encodeURIComponent(base)}`,
+	);
+	const baseSha = baseRef.object?.sha;
+	if (!baseSha) {
+		throw new Error(`Could not resolve ${owner}/${repo} ${base} base SHA.`);
+	}
+
+	const branch = `docs/notion-sync-${pageId.replace(/-/g, "").slice(0, 8)}-${Date.now()}`;
+	await githubRequest(
+		"POST",
+		`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/refs`,
+		{
+			ref: `refs/heads/${branch}`,
+			sha: baseSha,
+		},
+	);
+	const existing = await githubRequestOptional<{ sha?: string }>(
+		"GET",
+		`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodeURIComponentPath(path)}?ref=${encodeURIComponent(branch)}`,
+	);
+	await githubRequest(
+		"PUT",
+		`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodeURIComponentPath(path)}`,
+		{
+			message: `Update ${path} from Notion Wiki`,
+			content: Buffer.from(content, "utf8").toString("base64"),
+			branch,
+			...(existing?.sha ? { sha: existing.sha } : {}),
+		},
+	);
+
+	return githubRequest<{ html_url?: string; number?: number }>(
+		"POST",
+		`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls`,
+		{
+			title: `Update ${path} from Notion Wiki`,
+			head: branch,
+			base,
+			body: [
+				"Automated documentation sync from Notion Wiki.",
+				"",
+				`Notion page: ${pageId}`,
+				"",
+				"This PR was opened instead of pushing directly to main so Markdown changes can be reviewed before becoming the repo source of truth.",
+			].join("\n"),
+		},
+	);
+}
+
+async function githubRequest<T>(
+	method: string,
+	path: string,
+	body?: unknown,
+): Promise<T> {
+	const response = await fetch(`https://api.github.com${path}`, {
+		method,
+		headers: {
+			...githubHeaders(requireEnv("GITHUB_TOKEN")),
+			...(body ? { "Content-Type": "application/json" } : {}),
+		},
+		body: body ? JSON.stringify(body) : undefined,
+	});
+	await assertOk(response, `GitHub ${method} ${path}`);
+	return (await response.json()) as T;
+}
+
+async function githubRequestOptional<T>(
+	method: string,
+	path: string,
+	body?: unknown,
+): Promise<T | undefined> {
+	const response = await fetch(`https://api.github.com${path}`, {
+		method,
+		headers: {
+			...githubHeaders(requireEnv("GITHUB_TOKEN")),
+			...(body ? { "Content-Type": "application/json" } : {}),
+		},
+		body: body ? JSON.stringify(body) : undefined,
+	});
+	if (response.status === 404) {
+		return undefined;
+	}
+	await assertOk(response, `GitHub ${method} ${path}`);
+	return (await response.json()) as T;
+}
+
+function encodeURIComponentPath(path: string): string {
+	return path.split("/").map(encodeURIComponent).join("/");
+}
+
+function hashContent(content: string): string {
+	return crypto.createHash("sha256").update(content).digest("hex");
+}
+
+function richTextPropertyValue(property: unknown): string {
+	const richText = arrayValue(objectValue(property)?.rich_text);
+	return richText
+		.map((item) => stringValue(objectValue(item)?.plain_text))
+		.join("");
+}
 
 worker.sync("sentryIssuesSync", {
 	database: sentryIssues,
@@ -1232,7 +2102,7 @@ function formatGithubCommentMarkdown(comment: GitHubIssueComment): string {
 	const author = comment.user?.login ?? "Unknown";
 	const updated = comment.updated_at ?? comment.created_at ?? "Unknown time";
 	const body = comment.body?.trim()
-		? toBoundedMarkdown(comment.body.trim(), 2000)
+		? markdownCodeBlock(toBoundedMarkdown(comment.body.trim(), 2000), "md")
 		: "No comment body.";
 
 	return [
@@ -1259,7 +2129,7 @@ function formatGithubReviewMarkdown(review: GitHubPullRequestReview): string {
 	const state = review.state ?? "UNKNOWN";
 	const submittedAt = review.submitted_at ?? "Unknown time";
 	const body = review.body?.trim()
-		? `\n\n${toBoundedMarkdown(review.body.trim(), 1200)}`
+		? `\n\n${markdownCodeBlock(toBoundedMarkdown(review.body.trim(), 1200), "md")}`
 		: "";
 	const link = review.html_url ? `\n\n${review.html_url}` : "";
 	return [`### ${state} by ${author} at ${submittedAt}`, body, link, ""].join(
@@ -1288,6 +2158,11 @@ function toBoundedMarkdown(content: string, maxLength = 12000): string {
 	}
 
 	return `${content.slice(0, maxLength - 26)}\n\n... truncated for Notion`;
+}
+
+function markdownCodeBlock(content: string, language = ""): string {
+	const safeContent = content.replace(/```/g, "'''");
+	return [`\`\`\`${language}`, safeContent, "```"].join("\n");
 }
 
 type GithubNotionSchema = {
@@ -1829,6 +2704,8 @@ type NotionClientLike = {
 	};
 	pages: {
 		create: (args: Record<string, unknown>) => Promise<unknown>;
+		retrieve: (args: Record<string, unknown>) => Promise<unknown>;
+		retrieveMarkdown: (args: Record<string, unknown>) => Promise<unknown>;
 		update: (args: Record<string, unknown>) => Promise<unknown>;
 		updateMarkdown: (args: Record<string, unknown>) => Promise<unknown>;
 	};
