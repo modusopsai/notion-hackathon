@@ -1,4 +1,6 @@
 import crypto from "node:crypto";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import {
 	Worker,
 	RateLimitError,
@@ -7,7 +9,9 @@ import {
 import * as Builder from "@notionhq/workers/builder";
 import * as Schema from "@notionhq/workers/schema";
 import { j } from "@notionhq/workers/schema-builder";
-import type { JSONValue, TextValue } from "@notionhq/workers/types";
+import type { TextValue } from "@notionhq/workers/types";
+import { isFullBlock } from "@notionhq/client";
+import type { BlockObjectRequest, Client } from "@notionhq/client";
 
 const worker = new Worker();
 export default worker;
@@ -35,6 +39,12 @@ const GRANOLA_NOTION_DATA_SOURCE_ID_DEFAULT =
 	"3623edae-28d3-8095-958c-000b712611af";
 const SLACK_HISTORY_PAGE_SIZE = 15;
 const SLACK_DELTA_BUFFER_MS = 60_000;
+// The company Wiki database lives natively in Notion (not synced by this
+// worker). The readWiki tool queries it directly so the Custom Agent can
+// compare documented intent (PRDs, Feature Specs, ADRs, Runbooks) against
+// observed execution (commits, errors, meetings, messages).
+const WIKI_NOTION_DATA_SOURCE_ID_DEFAULT =
+	"3633edae-28d3-8028-b316-000bc8522720";
 
 const githubApi = worker.pacer("githubApi", {
 	allowedRequests: 10,
@@ -3401,6 +3411,1717 @@ async function fetchGranolaNotes(
 			return fetchGranolaNote(note.id, token, includeTranscript);
 		}),
 	);
+}
+
+type ThemeSources = {
+	github: string[] | null;
+	sentry: string[] | null;
+	granola: string[] | null;
+	slack: string[] | null;
+	wiki: string[] | null;
+};
+
+type Theme = {
+	name: string;
+	type: string;
+	summary: string;
+	confidence: number | null;
+	confidenceReasoning: string | null;
+	momentum: string | null;
+	stakeholders: string[] | null;
+	sources: ThemeSources;
+	insight: string | null;
+	openQuestions: string[] | null;
+	counterEvidence: string[] | null;
+};
+
+type Divergence = {
+	observation: string;
+	sources: string[] | null;
+	hypothesis: string | null;
+	whatToCheck: string | null;
+};
+
+type ForkItem = {
+	action: string;
+	owner: string;
+	timing: string;
+};
+
+type Forecast = {
+	dramaticEpigraph: string | null;
+	snapshot: string;
+	mischievousReading: string;
+	radiantReading: string;
+	fork: ForkItem[];
+	mischievousImageUrl: string | null;
+	radiantImageUrl: string | null;
+};
+
+const SOURCE_LABELS: Array<{ key: keyof ThemeSources; label: string }> = [
+	{ key: "github", label: "GitHub" },
+	{ key: "sentry", label: "Sentry" },
+	{ key: "granola", label: "Granola" },
+	{ key: "slack", label: "Slack" },
+	{ key: "wiki", label: "Wiki" },
+];
+
+worker.tool("createSynthesis", {
+	title: "Create Synthesis Page",
+	description:
+		"Publish a Notion synthesis page that names the implicit roadmap a team is building, by triangulating five sources: four Notion-synced execution streams (GitHub commits/PRs, Sentry issues, Granola meeting notes, Slack messages) plus the company Wiki (PRDs, Feature Specs, ADRs, Product Decision Records, Runbooks — the documented intent). The Custom Agent reads those sources directly, clusters cross-source signals into themes, names the divergences (especially intent-vs-execution gaps where the Wiki says one thing and execution shows another), and calls this tool with the result. This tool only renders the page; it does no reasoning.",
+	schema: j.object({
+		overview: j
+			.string()
+			.describe(
+				"2 to 4 sentence executive summary of the period: what the implicit roadmap appears to be, what the strongest cross-source signal is, and where the agent has the least confidence. Use hedged language ('appears to', 'suggests', 'likely'). This renders as a callout at the top of the page.",
+			),
+		themes: j
+			.array(
+				j.object({
+					name: j.string().describe("Theme name, 3 to 5 words."),
+					type: j
+						.string()
+						.describe(
+							'One of "feature", "refactor", "infrastructure", "exploration", "fix", "polish".',
+						),
+					summary: j
+						.string()
+						.describe(
+							"1 to 3 sentences describing what is converging here. Hedge where the evidence is thin ('appears to', 'likely', 'suggests').",
+						),
+					confidence: j
+						.number()
+						.describe("0.0 to 1.0 confidence in this theme.")
+						.nullable(),
+					confidenceReasoning: j
+						.string()
+						.describe(
+							"One sentence explaining why this confidence number, not just the number. Show your work: which sources reinforce, which are silent, what's ambiguous. Example: '0.85 — strong GitHub signal (8 commits, 2 PRs) plus a Granola mention; Sentry silent so no user pain confirmation.'",
+						)
+						.nullable(),
+					momentum: j
+						.string()
+						.describe(
+							"One short label for the direction of activity in this theme. Suggested vocabulary: 'rising', 'steady', 'cooling', 'dormant', 'emerging', 'finishing'. Pick what best matches the evidence.",
+						)
+						.nullable(),
+					stakeholders: j
+						.array(j.string())
+						.describe(
+							"Names of people involved across any source (GitHub actors, meeting attendees, Slack participants). Reveals concentration of ownership.",
+						)
+						.nullable(),
+					sources: j
+						.object({
+							github: j
+								.array(j.string())
+								.describe(
+									"Pre-formatted bullets for supporting GitHub events. Format: 'abc1234: fix OAuth redirect (alice)' or 'PR #42: tighten session storage (bob)'.",
+								)
+								.nullable(),
+							sentry: j
+								.array(j.string())
+								.describe(
+									"Pre-formatted bullets for related Sentry issues. Format: 'OAuth callback timeout (5 events, P1)'.",
+								)
+								.nullable(),
+							granola: j
+								.array(j.string())
+								.describe(
+									"Pre-formatted bullets for relevant Granola meeting notes. Format: 'Mon standup: auth issue raised by alice'.",
+								)
+								.nullable(),
+							slack: j
+								.array(j.string())
+								.describe(
+									"Pre-formatted bullets for relevant Slack messages. Format: '#eng-auth: 3 messages this week mentioning OAuth'.",
+								)
+								.nullable(),
+							wiki: j
+								.array(j.string())
+								.describe(
+									"Pre-formatted bullets for relevant Wiki pages (PRDs, Feature Specs, ADRs, Runbooks, Product/Engineering docs). Format: 'Feature Spec: Onboarding and Checkout (Draft) — names auth changes not yet in code' or 'Runbook: Sentry Triage — defines expected response to the OAuth alert climb'. Use this to surface intent-vs-execution gaps: documented expectations that reality is or isn't matching.",
+								)
+								.nullable(),
+						})
+						.describe(
+							"Per-source supporting evidence. Pass null (not an empty array) for sources that have no signal for this theme.",
+						),
+					insight: j
+						.string()
+						.describe(
+							"1 to 2 sentences of cross-source observation about this theme. Hedge claims you can't fully back. Example: 'Engineering appears to be actively closing this; the meeting cadence has dropped to one mention per week, which likely suggests it's near done rather than abandoned.'",
+						)
+						.nullable(),
+					openQuestions: j
+						.array(j.string())
+						.describe(
+							"1 to 3 hedged inferences or things a PM would want to verify. Each should explicitly hedge: 'Possibly X because Y, would confirm by checking Z.' These are the moments where the agent shows humility about what the data can support.",
+						)
+						.nullable(),
+					counterEvidence: j
+						.array(j.string())
+						.describe(
+							"Optional. 1 to 2 signals that disconfirm or complicate this theme, if any exist. Forces the agent to actively look for disconfirming evidence rather than only confirming. Pass null if there's none.",
+						)
+						.nullable(),
+				}),
+			)
+			.describe(
+				"The implicit roadmap: clusters of cross-source activity the agent inferred.",
+			),
+		divergences: j
+			.array(
+				j.object({
+					observation: j
+						.string()
+						.describe(
+							"One sentence naming a cross-source mismatch. Example: 'Granola mentions search v2 in 3 meetings, but no commits touch it.'",
+						),
+					sources: j
+						.array(j.string())
+						.describe(
+							"Which source names are involved, e.g. ['Granola', 'GitHub']. Optional.",
+						)
+						.nullable(),
+					hypothesis: j
+						.string()
+						.describe(
+							"Optional. One short hedged guess at why this divergence exists. Example: 'Possibly because the work was scoped out in planning but not formally cancelled.'",
+						)
+						.nullable(),
+					whatToCheck: j
+						.string()
+						.describe(
+							"Optional. One specific verification step a PM could take. Example: 'Worth confirming with @alice whether search v2 is still committed for this quarter.'",
+						)
+						.nullable(),
+				}),
+			)
+			.describe(
+				"Top-level mismatches between sources. This is the lean-forward beat of the synthesis: things the work isn't matching the talk, or vice versa.",
+			)
+			.nullable(),
+		forecast: j
+			.object({
+				dramaticEpigraph: j
+					.string()
+					.describe(
+						"Optional one-line dramatic quote rendered as a banner above the fork diagram. Should land between portentous and tongue-in-cheek — think Dante's 'Abandon all hope, ye who enter here' energy but specific to this synthesis. Reference what's actually in the snapshot. Under 15 words. Pass null to skip.",
+					)
+					.nullable(),
+				snapshot: j
+					.string()
+					.describe(
+						"Two to three sentences of factual current state across the most active workstreams. Prose, not bullets. Specific numbers where the evidence supports them. This is the unified preamble both readings work from.",
+					),
+				mischievousReading: j
+					.string()
+					.describe(
+						"Exactly four short paragraphs (separated by blank lines) in the voice of a slightly seductive observer delighted by patterns of dysfunction. EACH PARAGRAPH MUST BEGIN with a 🔥 emoji and a milestone label, formatted exactly as: '🔥 Weeks: ', '🔥 Months: ', '🔥 Quarter: ', '🔥 Year-end: '. Stepped detail across paragraphs. Paragraph 1 (🔥 Weeks): the next 1-2 weeks, grounded, specific, plausibly accurate, what a senior engineer would nod at. Paragraph 2 (🔥 Months): the next 1-2 months, slightly zoomed out but still concrete, patterns of avoidance and re-debate. Paragraph 3 (🔥 Quarter): comic-grotesque register — haunted branches, sole maintainers muttering, words nobody says anymore. Paragraph 4 (🔥 Year-end): minimal detail, maximum theme, folkloric and mythological. Reference items by name throughout. Mention dysfunction types (unwritten, unowned, drifting, single-author, oscillating, dropped) sparingly — at most three across both readings combined. NEVER accuse a named person of a character flaw — predict systems failing, not people.",
+					),
+				radiantReading: j
+					.string()
+					.describe(
+						"Exactly four short paragraphs (separated by blank lines) in the voice of a gracious observer seeing the version where small interventions land. EACH PARAGRAPH MUST BEGIN with a ☁️ emoji and a milestone label, formatted exactly as: '☁️ Weeks: ', '☁️ Months: ', '☁️ Quarter: ', '☁️ Year-end: '. Stepped detail matching the four heaven-path milestones (clarity, cadence, blessed, Paradiso). Address the same items as the Mischievous Reading, by name. Each prediction grounded in a reachable action by a specific actor on a specific timing. Never preachy. Long-horizon register: rapturous (ADRs becoming legend, new engineers weeping with gratitude, the codebase reads like scripture).",
+					),
+				fork: j
+					.array(
+						j.object({
+							action: j
+								.string()
+								.describe(
+									"The intervention. Under 20 words. Verb-led and specific.",
+								),
+							owner: j
+								.string()
+								.describe('Named person, or "needs an owner".'),
+							timing: j
+								.string()
+								.describe(
+									'Specific timing such as "by Tuesday", "this week", or "before next standup".',
+								),
+						}),
+					)
+					.describe(
+						"Three to five concrete interventions that make the Radiant Reading manifest. Each specific enough to put on a calendar.",
+					),
+				mischievousImageUrl: j
+					.string()
+					.describe(
+						"Optional public image URL to show alongside the Mischievous Reading. Defaults to a Gustave Doré Inferno illustration. Use any public-domain, GIF, or workplace-safe image URL you like.",
+					)
+					.nullable(),
+				radiantImageUrl: j
+					.string()
+					.describe(
+						"Optional public image URL to show alongside the Radiant Reading. Defaults to a Gustave Doré Paradiso illustration.",
+					)
+					.nullable(),
+			})
+			.describe(
+				"Optional heaven/hell forecast. The snapshot is shared between both readings. Both readings escalate from grounded near-term to mythological long-term. Pass null to omit the entire forecast section.",
+			)
+			.nullable(),
+		title: j
+			.string()
+			.describe(
+				"ALMOST ALWAYS pass null here — the default 'Two Roads — May 17, 2026' format is what we want. Only override with a custom title if explicitly asked. Never use event-specific titles like 'Launch Eve' or 'Q3 Kickoff' — the page is evergreen synthesis, not a single-event recap.",
+			)
+			.nullable(),
+		windowDescription: j
+			.string()
+			.describe(
+				"Human-readable description of the time window the agent analyzed, e.g. 'last 7 days', 'all available activity'. Shown in the page header.",
+			)
+			.nullable(),
+	}),
+	outputSchema: j.object({
+		pageId: j.string(),
+		url: j.string(),
+		themeCount: j.number(),
+		divergenceCount: j.number(),
+	}),
+	execute: async (
+		{ overview, themes, divergences, forecast, title, windowDescription },
+		{ notion },
+	) => {
+		const parentPageId = requireEnv("SYNTHESIS_PARENT_PAGE_ID");
+		const pageTitle = title ?? defaultSynthesisTitle();
+		const window = windowDescription ?? "the recent window";
+		const divergenceList = divergences ?? [];
+
+		// If a forecast is provided, resolve the two reading images. By default
+		// we upload the bundled heaven.gif / hell.gif via Notion file uploads;
+		// the agent can override per-call with mischievousImageUrl / radiantImageUrl.
+		let forecastImages: ForecastImages | null = null;
+		if (forecast) {
+			const [mischievous, radiant] = await Promise.all([
+				resolveForecastImage(
+					notion,
+					forecast.mischievousImageUrl,
+					"hell.gif",
+					DEFAULT_MISCHIEVOUS_IMAGE_URL,
+				),
+				resolveForecastImage(
+					notion,
+					forecast.radiantImageUrl,
+					"heaven.gif",
+					DEFAULT_RADIANT_IMAGE_URL,
+				),
+			]);
+			forecastImages = { mischievous, radiant };
+		}
+
+		const page = await notion.pages.create({
+			parent: { page_id: parentPageId },
+			properties: {
+				title: {
+					title: [{ type: "text", text: { content: pageTitle } }],
+				},
+			},
+			children: synthesisBlocks(
+				pageTitle,
+				overview,
+				themes,
+				divergenceList,
+				window,
+				forecast ?? null,
+				forecastImages,
+			),
+		});
+
+		return {
+			pageId: page.id,
+			url: (page as { url?: string }).url ?? "",
+			themeCount: themes.length,
+			divergenceCount: divergenceList.length,
+		};
+	},
+});
+
+function synthesisBlocks(
+	_pageTitle: string,
+	_overview: string,
+	themes: Theme[],
+	divergences: Divergence[],
+	_windowDescription: string,
+	forecast: Forecast | null,
+	forecastImages: ForecastImages | null,
+): BlockObjectRequest[] {
+	// Page is the heaven/hell. Order from top:
+	//   1. Epigraph callout (the hook)
+	//   2. Mermaid fork diagram (visual heaven/hell)
+	//   3. Side-by-side Mischievous / Radiant readings (the narratives)
+	//   4. Snapshot callout (compact context)
+	//   5. What to do right now (fork to-dos)
+	//   6. Toggle h2: Divergences (collapsed)
+	//   7. Toggle h2: Implicit roadmap (collapsed)
+	const blocks: BlockObjectRequest[] = [];
+
+	if (forecast) {
+		blocks.push(...forecastTopBlocks(forecast, forecastImages));
+	}
+
+	if (divergences.length > 0) {
+		blocks.push(
+			toggleHeading2(
+				"🔍 Where the signals diverge",
+				divergencesInner(divergences),
+			),
+		);
+	}
+
+	if (themes.length > 0) {
+		blocks.push(
+			toggleHeading2("🗺 The implicit roadmap", themesInner(themes)),
+		);
+	}
+
+	return blocks;
+}
+
+// Inner content for the divergences toggle. Each divergence is one bullet
+// with the observation; hypothesis and what-to-check become sub-bullets
+// underneath, kept compact.
+function divergencesInner(divergences: Divergence[]): BlockObjectRequest[] {
+	const blocks: BlockObjectRequest[] = [];
+	for (const d of divergences) {
+		const sources = (d.sources ?? []).filter(Boolean);
+		const tail = sources.length > 0 ? ` (${sources.join(" / ")})` : "";
+		const children: BlockObjectRequest[] = [];
+		if (d.hypothesis) {
+			children.push(bullet(`Hypothesis: ${d.hypothesis}`));
+		}
+		if (d.whatToCheck) {
+			children.push(bullet(`Worth checking: ${d.whatToCheck}`));
+		}
+		blocks.push(
+			bullet(
+				`${d.observation}${tail}`,
+				children.length > 0 ? children : undefined,
+			),
+		);
+	}
+	return blocks;
+}
+
+// Inner content for the implicit roadmap toggle. Each theme becomes a
+// toggle-h3 of its own, so readers can open the one they care about
+// without unfurling everything.
+function themesInner(themes: Theme[]): BlockObjectRequest[] {
+	const blocks: BlockObjectRequest[] = [];
+	for (const theme of themes) {
+		// Compact heading: name plus the at-a-glance attributes inline.
+		const headerParts: string[] = [`Type: ${theme.type}`];
+		if (typeof theme.confidence === "number") {
+			headerParts.push(`Confidence: ${theme.confidence.toFixed(2)}`);
+		}
+		if (theme.momentum) {
+			headerParts.push(`Momentum: ${theme.momentum}`);
+		}
+		const heading = `${theme.name}  ·  ${headerParts.join("  ·  ")}`;
+
+		const themeBody: BlockObjectRequest[] = [];
+
+		if (theme.confidenceReasoning) {
+			themeBody.push(
+				paragraph(`Confidence reasoning: ${theme.confidenceReasoning}`),
+			);
+		}
+		if (theme.summary) {
+			themeBody.push(paragraph(theme.summary));
+		}
+		if (theme.insight) {
+			themeBody.push(callout(theme.insight, "🔍"));
+		}
+		if (theme.stakeholders && theme.stakeholders.length > 0) {
+			themeBody.push(
+				paragraph(`Stakeholders: ${theme.stakeholders.join(", ")}`),
+			);
+		}
+		if (theme.openQuestions && theme.openQuestions.length > 0) {
+			themeBody.push(paragraph("Open questions:"));
+			for (const q of theme.openQuestions) {
+				themeBody.push(bullet(q));
+			}
+		}
+		if (theme.counterEvidence && theme.counterEvidence.length > 0) {
+			themeBody.push(paragraph("Counter-evidence:"));
+			for (const c of theme.counterEvidence) {
+				themeBody.push(bullet(c));
+			}
+		}
+
+		const populatedSources = SOURCE_LABELS.filter(({ key }) => {
+			const list = theme.sources?.[key];
+			return Array.isArray(list) && list.length > 0;
+		});
+		if (populatedSources.length > 0) {
+			themeBody.push(paragraph("Supporting signals by source:"));
+			// Flat bullets only — Notion caps create-time nesting at 2 child
+			// levels, and we're already inside a toggle h2 + toggle h3. Use
+			// the label-then-items pattern with the label as a paragraph so
+			// the items still read like a grouped list.
+			for (const { key, label } of populatedSources) {
+				const items = (theme.sources[key] ?? []).filter(Boolean);
+				themeBody.push(paragraph(`${label} (${items.length}):`));
+				for (const item of items) {
+					themeBody.push(bullet(item));
+				}
+			}
+		}
+
+		blocks.push(toggleHeading3(heading, themeBody));
+	}
+	return blocks;
+}
+
+// ============================================================================
+// read* tools — bulk-fetch synced substrate with full page bodies parsed
+// ============================================================================
+//
+// The Notion Custom Agent calls these once per source to get all the recent
+// data in a single structured payload, rather than opening pages individually.
+// The agent does the cross-source clustering; these tools do the mechanical
+// page-body reads and JSON parsing the agent shouldn't waste tokens on.
+
+type ParsedBody = {
+	markdown: string;
+	codeBlocks: Array<{ language: string; content: string }>;
+};
+
+async function readPageBody(notion: Client, pageId: string): Promise<ParsedBody> {
+	const lines: string[] = [];
+	const codeBlocks: Array<{ language: string; content: string }> = [];
+
+	let cursor: string | undefined;
+	do {
+		const response = await notion.blocks.children.list({
+			block_id: pageId,
+			start_cursor: cursor,
+			page_size: 100,
+		});
+
+		for (const block of response.results) {
+			if (!isFullBlock(block)) continue;
+
+			switch (block.type) {
+				case "paragraph": {
+					lines.push(richTextToString(block.paragraph.rich_text));
+					break;
+				}
+				case "heading_1": {
+					lines.push(`# ${richTextToString(block.heading_1.rich_text)}`);
+					break;
+				}
+				case "heading_2": {
+					lines.push(`## ${richTextToString(block.heading_2.rich_text)}`);
+					break;
+				}
+				case "heading_3": {
+					lines.push(`### ${richTextToString(block.heading_3.rich_text)}`);
+					break;
+				}
+				case "bulleted_list_item": {
+					lines.push(
+						`- ${richTextToString(block.bulleted_list_item.rich_text)}`,
+					);
+					break;
+				}
+				case "numbered_list_item": {
+					lines.push(
+						`1. ${richTextToString(block.numbered_list_item.rich_text)}`,
+					);
+					break;
+				}
+				case "code": {
+					const content = richTextToString(block.code.rich_text);
+					const language = block.code.language ?? "plain";
+					codeBlocks.push({ language, content });
+					lines.push("```" + language);
+					lines.push(content);
+					lines.push("```");
+					break;
+				}
+				case "callout": {
+					lines.push(`> ${richTextToString(block.callout.rich_text)}`);
+					break;
+				}
+				case "quote": {
+					lines.push(`> ${richTextToString(block.quote.rich_text)}`);
+					break;
+				}
+				case "divider": {
+					lines.push("---");
+					break;
+				}
+				default: {
+					break;
+				}
+			}
+		}
+
+		if (!response.has_more || !response.next_cursor) break;
+		cursor = response.next_cursor;
+	} while (cursor);
+
+	return { markdown: lines.join("\n"), codeBlocks };
+}
+
+function richTextToString(items: Array<{ plain_text?: string }>): string {
+	return items.map((r) => r.plain_text ?? "").join("");
+}
+
+function readPropertyValue(prop: unknown): string | number | boolean | null {
+	const record = objectValue(prop);
+	if (!record) return null;
+	const type = stringValue(record.type);
+
+	switch (type) {
+		case "title":
+			return richTextToString(
+				arrayValue(record.title) as Array<{ plain_text?: string }>,
+			);
+		case "rich_text":
+			return richTextToString(
+				arrayValue(record.rich_text) as Array<{ plain_text?: string }>,
+			);
+		case "number":
+			return typeof record.number === "number" ? record.number : null;
+		case "checkbox":
+			return typeof record.checkbox === "boolean" ? record.checkbox : null;
+		case "date": {
+			const date = objectValue(record.date);
+			return date ? stringValue(date.start) : null;
+		}
+		case "select": {
+			const sel = objectValue(record.select);
+			return sel ? stringValue(sel.name) : null;
+		}
+		case "multi_select":
+			return arrayValue(record.multi_select)
+				.map((m) => stringValue(objectValue(m)?.name))
+				.filter(Boolean)
+				.join(", ");
+		case "status": {
+			const s = objectValue(record.status);
+			return s ? stringValue(s.name) : null;
+		}
+		case "url":
+			return stringValue(record.url);
+		case "email":
+			return stringValue(record.email);
+		case "phone_number":
+			return stringValue(record.phone_number);
+		case "created_time":
+			return stringValue(record.created_time);
+		case "last_edited_time":
+			return stringValue(record.last_edited_time);
+		case "people":
+			return arrayValue(record.people)
+				.map((p) => {
+					const person = objectValue(p);
+					return (
+						stringValue(person?.name) || stringValue(person?.id)
+					);
+				})
+				.filter(Boolean)
+				.join(", ");
+		case "files":
+			return arrayValue(record.files)
+				.map((f) => stringValue(objectValue(f)?.name))
+				.filter(Boolean)
+				.join(", ");
+		default:
+			return null;
+	}
+}
+
+function queryPropertyValue(
+	properties: JsonRecord | undefined,
+	name: string,
+): string | number | boolean | null {
+	if (!properties) return null;
+	return readPropertyValue(properties[name]);
+}
+
+function pageProperties(page: unknown): JsonRecord | undefined {
+	const record = objectValue(page);
+	return record ? objectValue(record.properties) : undefined;
+}
+
+function pageId(page: unknown): string {
+	return stringValue(objectValue(page)?.id);
+}
+
+function findFirstJsonPayload(
+	codeBlocks: Array<{ language: string; content: string }>,
+): JsonRecord | undefined {
+	const json = codeBlocks.find(
+		(c) => c.language === "json" || c.language === "plain",
+	);
+	if (!json) return undefined;
+	try {
+		const cleaned = json.content.replace(/\n\.\.\. truncated$/, "");
+		return objectValue(JSON.parse(cleaned));
+	} catch {
+		return undefined;
+	}
+}
+
+// ---------- readGithubActivity ---------------------------------------------
+
+worker.tool("readGithubActivity", {
+	title: "Read GitHub Activity",
+	description:
+		"Fetch recent issues and pull requests from the GitHub Notion database (populated by Notion's GitHub connector) with page bodies. Returns structured records with title, type, author, repo, state, merged/draft status, labels, dates, and the full body markdown. The Notion Custom Agent calls this to get rich GitHub substrate for theme clustering.",
+	schema: j.object({
+		sinceDays: j
+			.number()
+			.describe("Look back N days by Created Time. Defaults to 90, cap 90.")
+			.nullable(),
+		limit: j
+			.number()
+			.describe("Max rows to fetch. Defaults to 200, cap 200.")
+			.nullable(),
+		types: j
+			.array(j.string())
+			.describe(
+				"GitHub item types to include, e.g. ['Pull Request', 'Issue']. If omitted, returns all types.",
+			)
+			.nullable(),
+	}),
+	outputSchema: j.object({
+		items: j.array(
+			j.object({
+				id: j.string(),
+				title: j.string(),
+				type: j.string(),
+				author: j.string(),
+				repoFullName: j.string(),
+				number: j.number(),
+				state: j.string(),
+				stateReason: j.string(),
+				merged: j.boolean(),
+				draft: j.boolean(),
+				labels: j.string(),
+				assignees: j.string(),
+				milestone: j.string(),
+				createdAt: j.string(),
+				updatedAt: j.string(),
+				closedAt: j.string(),
+				comments: j.number(),
+				additions: j.number(),
+				deletions: j.number(),
+				changedFiles: j.number(),
+				url: j.string(),
+				bodyMarkdown: j.string(),
+			}),
+		),
+		totalReturned: j.number(),
+	}),
+	execute: async ({ sinceDays, limit, types }, { notion }) => {
+		const dataSourceId = requireEnv("GITHUB_ACTIVITY_DATA_SOURCE_ID");
+		const lookback = Math.min(sinceDays ?? 90, 90);
+		const max = Math.min(limit ?? 200, 200);
+		const since = new Date(
+			Date.now() - lookback * 86_400_000,
+		).toISOString();
+
+		const filter: Record<string, unknown> = {
+			and: [{ property: "Created Time", date: { on_or_after: since } }],
+		};
+		if (types && types.length > 0) {
+			(filter.and as unknown[]).push({
+				or: types.map((t) => ({
+					property: "Type",
+					rich_text: { equals: t },
+				})),
+			});
+		}
+
+		const items: Array<NonNullable<ReturnType<typeof parseGithubItem>>> = [];
+		let cursor: string | undefined;
+		while (items.length < max) {
+			const response = await notion.dataSources.query({
+				data_source_id: dataSourceId,
+				filter: filter as never,
+				sorts: [{ property: "Created Time", direction: "descending" }],
+				page_size: Math.min(100, max - items.length),
+				start_cursor: cursor,
+			});
+
+			for (const page of response.results) {
+				const id = pageId(page);
+				if (!id) continue;
+				const properties = pageProperties(page);
+				if (!properties) continue;
+				const body = await readPageBody(notion, id);
+				const item = parseGithubItem(properties, body);
+				if (item) items.push(item);
+				if (items.length >= max) break;
+			}
+
+			if (!response.has_more || !response.next_cursor) break;
+			cursor = response.next_cursor;
+		}
+
+		return {
+			items,
+			totalReturned: items.length,
+		};
+	},
+});
+
+// Parser for rows in the Notion GitHub connector schema (issues + pull requests).
+// Schema reference (from the live "Data Sources / GitHub" tab):
+//   GitHub Item ID, Name (title), Type, Author, Repo Full Name, Number,
+//   State, State Reason, Merged, Draft, Labels, Assignees, Milestone,
+//   Created Time, Updated Time, Closed Time, Comments,
+//   Additions, Deletions, Changed Files, URL
+function parseGithubItem(
+	properties: JsonRecord,
+	body: ParsedBody,
+): {
+	id: string;
+	title: string;
+	type: string;
+	author: string;
+	repoFullName: string;
+	number: number;
+	state: string;
+	stateReason: string;
+	merged: boolean;
+	draft: boolean;
+	labels: string;
+	assignees: string;
+	milestone: string;
+	createdAt: string;
+	updatedAt: string;
+	closedAt: string;
+	comments: number;
+	additions: number;
+	deletions: number;
+	changedFiles: number;
+	url: string;
+	bodyMarkdown: string;
+} | null {
+	const id = stringValue(queryPropertyValue(properties, "GitHub Item ID"));
+	if (!id) return null;
+
+	const numberRaw = queryPropertyValue(properties, "Number");
+	const commentsRaw = queryPropertyValue(properties, "Comments");
+	const additionsRaw = queryPropertyValue(properties, "Additions");
+	const deletionsRaw = queryPropertyValue(properties, "Deletions");
+	const changedFilesRaw = queryPropertyValue(properties, "Changed Files");
+	const mergedRaw = queryPropertyValue(properties, "Merged");
+	const draftRaw = queryPropertyValue(properties, "Draft");
+
+	return {
+		id,
+		title: stringValue(queryPropertyValue(properties, "Name")),
+		type: stringValue(queryPropertyValue(properties, "Type")),
+		author: stringValue(queryPropertyValue(properties, "Author")),
+		repoFullName: stringValue(
+			queryPropertyValue(properties, "Repo Full Name"),
+		),
+		number: typeof numberRaw === "number" ? numberRaw : 0,
+		state: stringValue(queryPropertyValue(properties, "State")),
+		stateReason: stringValue(queryPropertyValue(properties, "State Reason")),
+		merged: mergedRaw === true,
+		draft: draftRaw === true,
+		labels: stringValue(queryPropertyValue(properties, "Labels")),
+		assignees: stringValue(queryPropertyValue(properties, "Assignees")),
+		milestone: stringValue(queryPropertyValue(properties, "Milestone")),
+		createdAt: stringValue(queryPropertyValue(properties, "Created Time")),
+		updatedAt: stringValue(queryPropertyValue(properties, "Updated Time")),
+		closedAt: stringValue(queryPropertyValue(properties, "Closed Time")),
+		comments: typeof commentsRaw === "number" ? commentsRaw : 0,
+		additions: typeof additionsRaw === "number" ? additionsRaw : 0,
+		deletions: typeof deletionsRaw === "number" ? deletionsRaw : 0,
+		changedFiles:
+			typeof changedFilesRaw === "number" ? changedFilesRaw : 0,
+		url: stringValue(queryPropertyValue(properties, "URL")),
+		bodyMarkdown: body.markdown,
+	};
+}
+
+// ---------- readSentryIssues -----------------------------------------------
+
+worker.tool("readSentryIssues", {
+	title: "Read Sentry Issues",
+	description:
+		"Fetch recent rows from the Sentry Issues Notion database. Returns structured issue records with culprit, level, status, counts, and dates. Useful for the Notion Custom Agent when reasoning about user-facing pain alongside other sources.",
+	schema: j.object({
+		sinceDays: j
+			.number()
+			.describe(
+				"Look back N days based on Last Seen. Defaults to 30, cap 90.",
+			)
+			.nullable(),
+		limit: j
+			.number()
+			.describe("Max rows to fetch. Defaults to 30, cap 200.")
+			.nullable(),
+		levels: j
+			.array(j.string())
+			.describe(
+				"Sentry levels to include, e.g. ['error', 'fatal']. If omitted, returns all levels.",
+			)
+			.nullable(),
+	}),
+	outputSchema: j.object({
+		issues: j.array(
+			j.object({
+				id: j.string(),
+				title: j.string(),
+				culprit: j.string(),
+				level: j.string(),
+				status: j.string(),
+				project: j.string(),
+				userCount: j.number(),
+				eventCount: j.number(),
+				firstSeen: j.string(),
+				lastSeen: j.string(),
+				permalink: j.string(),
+				bodyMarkdown: j.string(),
+			}),
+		),
+		totalReturned: j.number(),
+	}),
+	execute: async ({ sinceDays, limit, levels }, { notion }) => {
+		const dataSourceId = requireEnv("SENTRY_ISSUES_DATA_SOURCE_ID");
+		const lookback = Math.min(sinceDays ?? 90, 90);
+		const max = Math.min(limit ?? 200, 200);
+		const since = new Date(
+			Date.now() - lookback * 86_400_000,
+		).toISOString();
+
+		const filter: Record<string, unknown> = {
+			and: [{ property: "Last Seen", date: { on_or_after: since } }],
+		};
+		if (levels && levels.length > 0) {
+			(filter.and as unknown[]).push({
+				or: levels.map((l) => ({
+					property: "Level",
+					rich_text: { equals: l },
+				})),
+			});
+		}
+
+		const issues: Array<{
+			id: string;
+			title: string;
+			culprit: string;
+			level: string;
+			status: string;
+			project: string;
+			userCount: number;
+			eventCount: number;
+			firstSeen: string;
+			lastSeen: string;
+			permalink: string;
+			bodyMarkdown: string;
+		}> = [];
+		let cursor: string | undefined;
+
+		while (issues.length < max) {
+			const response = await notion.dataSources.query({
+				data_source_id: dataSourceId,
+				filter: filter as never,
+				sorts: [{ property: "Last Seen", direction: "descending" }],
+				page_size: Math.min(100, max - issues.length),
+				start_cursor: cursor,
+			});
+
+			for (const page of response.results) {
+				const id = pageId(page);
+				if (!id) continue;
+				const properties = pageProperties(page);
+				if (!properties) continue;
+				const sentryId = stringValue(
+					queryPropertyValue(properties, "Sentry Issue ID"),
+				);
+				if (!sentryId) continue;
+				const body = await readPageBody(notion, id);
+				const userCount = queryPropertyValue(properties, "User Count");
+				const eventCount = queryPropertyValue(properties, "Event Count");
+
+				issues.push({
+					id: sentryId,
+					title: stringValue(queryPropertyValue(properties, "Issue")),
+					culprit: stringValue(queryPropertyValue(properties, "Culprit")),
+					level: stringValue(queryPropertyValue(properties, "Level")),
+					status: stringValue(queryPropertyValue(properties, "Status")),
+					project: stringValue(queryPropertyValue(properties, "Project")),
+					userCount: typeof userCount === "number" ? userCount : 0,
+					eventCount: typeof eventCount === "number" ? eventCount : 0,
+					firstSeen: stringValue(
+						queryPropertyValue(properties, "First Seen"),
+					),
+					lastSeen: stringValue(
+						queryPropertyValue(properties, "Last Seen"),
+					),
+					permalink: stringValue(
+						queryPropertyValue(properties, "Permalink"),
+					),
+					bodyMarkdown: body.markdown,
+				});
+
+				if (issues.length >= max) break;
+			}
+
+			if (!response.has_more || !response.next_cursor) break;
+			cursor = response.next_cursor;
+		}
+
+		return { issues, totalReturned: issues.length };
+	},
+});
+
+// ---------- readGranolaNotes -----------------------------------------------
+
+worker.tool("readGranolaNotes", {
+	title: "Read Granola Notes",
+	description:
+		"Fetch recent rows from the Granola Notes Notion database with full page bodies. Returns structured note records with owner, attendees, meeting time, summary, action items, and the full body markdown (optionally including transcript content if the sync stored it).",
+	schema: j.object({
+		sinceDays: j
+			.number()
+			.describe(
+				"Look back N days based on Meeting Time. Defaults to 30, cap 180.",
+			)
+			.nullable(),
+		limit: j
+			.number()
+			.describe("Max rows to fetch. Defaults to 20, cap 100.")
+			.nullable(),
+	}),
+	outputSchema: j.object({
+		notes: j.array(
+			j.object({
+				id: j.string(),
+				title: j.string(),
+				owner: j.string(),
+				attendees: j.string(),
+				meetingTime: j.string(),
+				summary: j.string(),
+				actionItems: j.string(),
+				updatedTime: j.string(),
+				webUrl: j.string(),
+				bodyMarkdown: j.string(),
+			}),
+		),
+		totalReturned: j.number(),
+	}),
+	execute: async ({ sinceDays, limit }, { notion }) => {
+		const dataSourceId = requireEnv("GRANOLA_NOTES_DATA_SOURCE_ID");
+		const lookback = Math.min(sinceDays ?? 180, 180);
+		const max = Math.min(limit ?? 100, 100);
+		const since = new Date(
+			Date.now() - lookback * 86_400_000,
+		).toISOString();
+
+		const notes: Array<{
+			id: string;
+			title: string;
+			owner: string;
+			attendees: string;
+			meetingTime: string;
+			summary: string;
+			actionItems: string;
+			updatedTime: string;
+			webUrl: string;
+			bodyMarkdown: string;
+		}> = [];
+		let cursor: string | undefined;
+
+		while (notes.length < max) {
+			const response = await notion.dataSources.query({
+				data_source_id: dataSourceId,
+				filter: {
+					property: "Meeting Time",
+					date: { on_or_after: since },
+				} as never,
+				sorts: [{ property: "Meeting Time", direction: "descending" }],
+				page_size: Math.min(100, max - notes.length),
+				start_cursor: cursor,
+			});
+
+			for (const page of response.results) {
+				const id = pageId(page);
+				if (!id) continue;
+				const properties = pageProperties(page);
+				if (!properties) continue;
+				const noteId = stringValue(
+					queryPropertyValue(properties, "Granola Note ID"),
+				);
+				if (!noteId) continue;
+				const body = await readPageBody(notion, id);
+
+				notes.push({
+					id: noteId,
+					title: stringValue(queryPropertyValue(properties, "Note")),
+					owner: stringValue(queryPropertyValue(properties, "Owner")),
+					attendees: stringValue(
+						queryPropertyValue(properties, "Attendees"),
+					),
+					meetingTime: stringValue(
+						queryPropertyValue(properties, "Meeting Time"),
+					),
+					summary: stringValue(
+						queryPropertyValue(properties, "Summary"),
+					),
+					actionItems: stringValue(
+						queryPropertyValue(properties, "Action Items"),
+					),
+					updatedTime: stringValue(
+						queryPropertyValue(properties, "Updated Time"),
+					),
+					webUrl: stringValue(queryPropertyValue(properties, "Web URL")),
+					bodyMarkdown: body.markdown,
+				});
+
+				if (notes.length >= max) break;
+			}
+
+			if (!response.has_more || !response.next_cursor) break;
+			cursor = response.next_cursor;
+		}
+
+		return { notes, totalReturned: notes.length };
+	},
+});
+
+// ---------- readSlackMessages (generic, schema-agnostic) -------------------
+
+worker.tool("readSlackMessages", {
+	title: "Read Slack Messages",
+	description:
+		"Fetch recent rows from the Slack-synced Notion database. Because the Slack DB is a Notion-managed connector whose schema we don't own, properties are returned generically as name/value pairs along with the full page body markdown. The agent decides what to use.",
+	schema: j.object({
+		limit: j
+			.number()
+			.describe("Max rows to fetch. Defaults to 50, cap 200.")
+			.nullable(),
+	}),
+	outputSchema: j.object({
+		messages: j.array(
+			j.object({
+				id: j.string(),
+				properties: j.array(
+					j.object({
+						name: j.string(),
+						value: j.string(),
+					}),
+				),
+				bodyMarkdown: j.string(),
+			}),
+		),
+		totalReturned: j.number(),
+	}),
+	execute: async ({ limit }, { notion }) => {
+		const dataSourceId = requireEnv("SLACK_MESSAGES_DATA_SOURCE_ID");
+		const max = Math.min(limit ?? 200, 200);
+
+		const messages: Array<{
+			id: string;
+			properties: Array<{ name: string; value: string }>;
+			bodyMarkdown: string;
+		}> = [];
+		let cursor: string | undefined;
+
+		while (messages.length < max) {
+			const response = await notion.dataSources.query({
+				data_source_id: dataSourceId,
+				page_size: Math.min(100, max - messages.length),
+				start_cursor: cursor,
+			});
+
+			for (const page of response.results) {
+				const id = pageId(page);
+				if (!id) continue;
+				const properties = pageProperties(page);
+				if (!properties) continue;
+				const body = await readPageBody(notion, id);
+
+				const flatProps: Array<{ name: string; value: string }> = [];
+				for (const [name, prop] of Object.entries(properties)) {
+					const value = readPropertyValue(prop);
+					if (value === null) continue;
+					flatProps.push({ name, value: String(value) });
+				}
+
+				messages.push({
+					id,
+					properties: flatProps,
+					bodyMarkdown: body.markdown,
+				});
+
+				if (messages.length >= max) break;
+			}
+
+			if (!response.has_more || !response.next_cursor) break;
+			cursor = response.next_cursor;
+		}
+
+		return { messages, totalReturned: messages.length };
+	},
+});
+
+// ---------- readWiki ------------------------------------------------------
+
+function wikiNotionTargetId(): string {
+	return (
+		process.env.WIKI_NOTION_DATA_SOURCE_ID ??
+		WIKI_NOTION_DATA_SOURCE_ID_DEFAULT
+	);
+}
+
+worker.tool("readWiki", {
+	title: "Read Wiki Pages",
+	description:
+		"Fetch wiki pages from the company Notion Wiki with full body markdown. Returns the documented intent of the team: PRDs, Feature Specs, ADRs, Product Decision Records, Runbooks, and other Product/Engineering/Operations documentation. Use this to compare documented expectations against observed execution (commits, errors, meetings, messages). The most valuable synthesis output is the gap between what these docs say should happen and what the other sources show actually happening.",
+	schema: j.object({
+		sinceDays: j
+			.number()
+			.describe(
+				"Look back N days by Last Updated. Defaults to 90, cap 365.",
+			)
+			.nullable(),
+		limit: j
+			.number()
+			.describe("Max pages to fetch. Defaults to 20, cap 100.")
+			.nullable(),
+		categories: j
+			.array(j.string())
+			.describe(
+				'Optional categories to filter to. Valid values: "Product", "Engineering", "Marketing", "Sales", "HR", "Operations", "Finance", "Legal". Defaults to all categories. For synthesis work, the most relevant are typically Product, Engineering, and Operations.',
+			)
+			.nullable(),
+	}),
+	outputSchema: j.object({
+		pages: j.array(
+			j.object({
+				id: j.string(),
+				title: j.string(),
+				category: j.string(),
+				status: j.string(),
+				priority: j.string(),
+				tags: j.string(),
+				owner: j.string(),
+				lastUpdated: j.string(),
+				webUrl: j.string(),
+				bodyMarkdown: j.string(),
+			}),
+		),
+		totalReturned: j.number(),
+	}),
+	execute: async ({ sinceDays, limit, categories }, { notion }) => {
+		const dataSourceId = wikiNotionTargetId();
+		const lookback = Math.min(sinceDays ?? 365, 365);
+		const max = Math.min(limit ?? 100, 100);
+		const since = new Date(
+			Date.now() - lookback * 86_400_000,
+		).toISOString();
+
+		const dateFilter = {
+			property: "Last Updated",
+			date: { on_or_after: since },
+		};
+
+		let combinedFilter: unknown = dateFilter;
+		if (categories && categories.length > 0) {
+			combinedFilter = {
+				and: [
+					dateFilter,
+					{
+						or: categories.map((cat) => ({
+							property: "Category",
+							select: { equals: cat },
+						})),
+					},
+				],
+			};
+		}
+
+		const pages: Array<{
+			id: string;
+			title: string;
+			category: string;
+			status: string;
+			priority: string;
+			tags: string;
+			owner: string;
+			lastUpdated: string;
+			webUrl: string;
+			bodyMarkdown: string;
+		}> = [];
+		let cursor: string | undefined;
+
+		while (pages.length < max) {
+			const response = await notion.dataSources.query({
+				data_source_id: dataSourceId,
+				filter: combinedFilter as never,
+				sorts: [{ property: "Last Updated", direction: "descending" }],
+				page_size: Math.min(100, max - pages.length),
+				start_cursor: cursor,
+			});
+
+			for (const page of response.results) {
+				const id = pageId(page);
+				if (!id) continue;
+				const properties = pageProperties(page);
+				if (!properties) continue;
+				const body = await readPageBody(notion, id);
+
+				pages.push({
+					id,
+					title: stringValue(queryPropertyValue(properties, "Title")),
+					category: stringValue(
+						queryPropertyValue(properties, "Category"),
+					),
+					status: stringValue(queryPropertyValue(properties, "Status")),
+					priority: stringValue(
+						queryPropertyValue(properties, "Priority"),
+					),
+					tags: stringValue(queryPropertyValue(properties, "Tags")),
+					owner: stringValue(queryPropertyValue(properties, "Owner")),
+					lastUpdated: stringValue(
+						queryPropertyValue(properties, "Last Updated"),
+					),
+					webUrl: (page as { url?: string }).url ?? "",
+					bodyMarkdown: body.markdown,
+				});
+
+				if (pages.length >= max) break;
+			}
+
+			if (!response.has_more || !response.next_cursor) break;
+			cursor = response.next_cursor;
+		}
+
+		return { pages, totalReturned: pages.length };
+	},
+});
+
+function paragraphHeading(
+	content: string,
+	level: "heading_1" | "heading_2" | "heading_3",
+	color?: QuoteColor,
+): BlockObjectRequest {
+	const colorField = color ? { color } : {};
+	if (level === "heading_1") {
+		return {
+			object: "block",
+			type: "heading_1",
+			heading_1: {
+				rich_text: [{ type: "text", text: { content } }],
+				...colorField,
+			},
+		};
+	}
+	if (level === "heading_2") {
+		return {
+			object: "block",
+			type: "heading_2",
+			heading_2: {
+				rich_text: [{ type: "text", text: { content } }],
+				...colorField,
+			},
+		};
+	}
+	return {
+		object: "block",
+		type: "heading_3",
+		heading_3: {
+			rich_text: [{ type: "text", text: { content } }],
+			...colorField,
+		},
+	};
+}
+
+function paragraph(content: string): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "paragraph",
+		paragraph: {
+			rich_text: [{ type: "text", text: { content } }],
+		},
+	};
+}
+
+function bullet(
+	content: string,
+	children?: BlockObjectRequest[],
+): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "bulleted_list_item",
+		bulleted_list_item: {
+			rich_text: [{ type: "text", text: { content } }],
+			...(children && children.length > 0
+				? { children: children as never }
+				: {}),
+		},
+	};
+}
+
+function callout(content: string, emoji: string): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "callout",
+		callout: {
+			rich_text: [{ type: "text", text: { content } }],
+			icon: { type: "emoji", emoji: emoji as never },
+		},
+	};
+}
+
+function divider(): BlockObjectRequest {
+	return { object: "block", type: "divider", divider: {} };
+}
+
+// Default page title: "Two Roads — May 17, 2026". A nod to the two paths
+// the forecast section projects, with a plain-language date that's easier
+// to scan than an ISO timestamp.
+function defaultSynthesisTitle(): string {
+	const dateStr = new Date().toLocaleDateString("en-US", {
+		year: "numeric",
+		month: "long",
+		day: "numeric",
+	});
+	return `Two Roads — ${dateStr}`;
+}
+
+// ----------------------------------------------------------------------------
+// Forecast section helpers — the heaven/hell projection rendered after themes
+// ----------------------------------------------------------------------------
+
+// Gustave Doré illustrations from Dante's Divine Comedy. Public domain,
+// hosted on Wikimedia Commons. The agent can override these via the
+// mischievousImageUrl / radiantImageUrl fields in the forecast input.
+const DEFAULT_MISCHIEVOUS_IMAGE_URL =
+	"https://upload.wikimedia.org/wikipedia/commons/0/0a/Gustave_Dor%C3%A9_-_Dante_Alighieri_-_Inferno_-_Plate_65_%28Canto_XXXIV_-_Lucifer%29.jpg";
+
+const DEFAULT_RADIANT_IMAGE_URL =
+	"https://upload.wikimedia.org/wikipedia/commons/a/a0/Paradiso_Canto_31.jpg";
+
+type CalloutColor =
+	| "default"
+	| "gray_background"
+	| "brown_background"
+	| "orange_background"
+	| "yellow_background"
+	| "green_background"
+	| "blue_background"
+	| "purple_background"
+	| "pink_background"
+	| "red_background";
+
+type QuoteColor =
+	| "default"
+	| "gray"
+	| "brown"
+	| "orange"
+	| "yellow"
+	| "green"
+	| "blue"
+	| "purple"
+	| "pink"
+	| "red";
+
+function mermaidDiagram(content: string): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "code",
+		code: {
+			rich_text: [{ type: "text", text: { content } }],
+			language: "mermaid" as never,
+		},
+	};
+}
+
+function quote(content: string, color: QuoteColor = "default"): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "quote",
+		quote: {
+			rich_text: [{ type: "text", text: { content } }],
+			color,
+		},
+	};
+}
+
+function todo(content: string, checked = false): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "to_do",
+		to_do: {
+			rich_text: [{ type: "text", text: { content } }],
+			checked,
+		},
+	};
+}
+
+function externalImage(url: string, caption?: string): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "image",
+		image: {
+			type: "external",
+			external: { url },
+			...(caption
+				? { caption: [{ type: "text", text: { content: caption } }] }
+				: {}),
+		},
+	};
+}
+
+// Image block that references a Notion file upload by ID. Used for the
+// bundled heaven.gif and hell.gif assets that we upload at synthesis time.
+function uploadedImage(
+	fileUploadId: string,
+	caption?: string,
+): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "image",
+		image: {
+			type: "file_upload",
+			file_upload: { id: fileUploadId },
+			...(caption
+				? { caption: [{ type: "text", text: { content: caption } }] }
+				: {}),
+		},
+	};
+}
+
+// A resolved image reference for the forecast section. Either an external
+// URL (user-provided override) or a Notion file_upload_id (we uploaded
+// the bundled GIF at synthesis time).
+type ForecastImageRef =
+	| { kind: "external"; url: string }
+	| { kind: "file_upload"; id: string };
+
+type ForecastImages = {
+	mischievous: ForecastImageRef;
+	radiant: ForecastImageRef;
+};
+
+function forecastImageBlock(
+	ref: ForecastImageRef,
+	caption?: string,
+): BlockObjectRequest {
+	if (ref.kind === "external") {
+		return externalImage(ref.url, caption);
+	}
+	return uploadedImage(ref.id, caption);
+}
+
+// Upload a local GIF asset (heaven.gif / hell.gif) to Notion and return
+// the resulting file_upload_id, which can then be referenced in image blocks.
+// Uses the SDK's two-step upload flow: create the upload object, then send
+// the file bytes as a single-part multipart payload.
+async function uploadForecastGif(
+	notion: Client,
+	filename: string,
+): Promise<string> {
+	const filePath = path.join(__dirname, "images", filename);
+	const data = await readFile(filePath);
+	const upload = await notion.fileUploads.create({
+		mode: "single_part",
+		filename,
+		content_type: "image/gif",
+	});
+	await notion.fileUploads.send({
+		file_upload_id: upload.id,
+		file: {
+			filename,
+			// Copy into a fresh ArrayBuffer-backed Uint8Array. fs.readFile
+			// returns a Buffer whose underlying buffer may be a shared pool,
+			// which doesn't satisfy DOM's strict BlobPart type.
+			data: new Blob([Uint8Array.from(data)], { type: "image/gif" }),
+		},
+	});
+	return upload.id;
+}
+
+// Resolve a forecast image: if the agent passed an override URL, use it as
+// an external image; otherwise upload the bundled default GIF and reference
+// it by file_upload_id. Falls back to the Doré URL if the upload fails so
+// the page still renders cleanly.
+async function resolveForecastImage(
+	notion: Client,
+	overrideUrl: string | null,
+	defaultGifFilename: string,
+	fallbackUrl: string,
+): Promise<ForecastImageRef> {
+	if (overrideUrl) {
+		return { kind: "external", url: overrideUrl };
+	}
+	try {
+		const id = await uploadForecastGif(notion, defaultGifFilename);
+		return { kind: "file_upload", id };
+	} catch (err) {
+		console.error(
+			`Failed to upload ${defaultGifFilename}, falling back to default URL:`,
+			err,
+		);
+		return { kind: "external", url: fallbackUrl };
+	}
+}
+
+function coloredCallout(
+	content: string,
+	emoji: string,
+	color: CalloutColor = "default",
+): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "callout",
+		callout: {
+			rich_text: [{ type: "text", text: { content } }],
+			icon: { type: "emoji", emoji: emoji as never },
+			color,
+		},
+	};
+}
+
+function columnList(columns: BlockObjectRequest[][]): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "column_list",
+		column_list: {
+			children: columns.map((children) => ({
+				object: "block" as const,
+				type: "column" as const,
+				column: { children },
+			})) as never,
+		},
+	};
+}
+
+// Toggleable heading — a section header that collapses its children. Lets
+// us land a tight hero above the fold and tuck long-form content behind
+// disclosure arrows so the page reads fast and rewards expansion.
+function toggleHeading2(
+	content: string,
+	children: BlockObjectRequest[],
+): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "heading_2",
+		heading_2: {
+			rich_text: [{ type: "text", text: { content } }],
+			is_toggleable: true,
+			children: children as never,
+		},
+	};
+}
+
+function toggleHeading3(
+	content: string,
+	children: BlockObjectRequest[],
+): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "heading_3",
+		heading_3: {
+			rich_text: [{ type: "text", text: { content } }],
+			is_toggleable: true,
+			children: children as never,
+		},
+	};
+}
+
+function splitParagraphs(text: string): string[] {
+	return text
+		.split(/\n\s*\n/)
+		.map((p) => p.trim())
+		.filter((p) => p.length > 0);
+}
+
+// The full forecast section, top-down. Epigraph, mermaid, side-by-side
+// readings, snapshot, to-dos. The heaven/hell is the page.
+function forecastTopBlocks(
+	forecast: Forecast,
+	forecastImages: ForecastImages | null,
+): BlockObjectRequest[] {
+	const blocks: BlockObjectRequest[] = [];
+
+	// Optional dramatic epigraph — sets the tone above everything else.
+	if (forecast.dramaticEpigraph) {
+		blocks.push(
+			coloredCallout(forecast.dramaticEpigraph, "⚜️", "orange_background"),
+		);
+	}
+
+	// Visual centerpiece: the forking trajectory rendered as a Mermaid diagram.
+	// Four milestones per path, color-coded red (hell) and blue (heaven) via
+	// classDef. Flame and cloud emoji reinforce the heaven/hell theme.
+	blocks.push(
+		mermaidDiagram(
+			[
+				"graph LR",
+				'  S["📍 Right now"]',
+				'  S --> F{"🔱 The Fork"}',
+				'  F -->|"Without intervention"| H1["🔥 Weeks: friction"]',
+				'  H1 --> H2["🔥 Months: drift"]',
+				'  H2 --> H3["🔥 Quarter: haunted"]',
+				'  H3 --> H4["🌋 Year-end: Inferno"]',
+				'  F -->|"With intervention"| A1["☁️ Weeks: clarity"]',
+				'  A1 --> A2["☁️ Months: cadence"]',
+				'  A2 --> A3["☁️ Quarter: blessed"]',
+				'  A3 --> A4["✨ Year-end: Paradiso"]',
+				"  classDef hell fill:#fee2e2,stroke:#dc2626,color:#7f1d1d",
+				"  classDef heaven fill:#dbeafe,stroke:#2563eb,color:#1e3a8a",
+				"  class H1,H2,H3,H4 hell",
+				"  class A1,A2,A3,A4 heaven",
+			].join("\n"),
+		),
+	);
+
+	// Side-by-side readings — possible because we're at top level, not
+	// inside a toggle (column_list doesn't nest in heading children).
+	const mischievousImage: ForecastImageRef =
+		forecastImages?.mischievous ?? {
+			kind: "external",
+			url: forecast.mischievousImageUrl ?? DEFAULT_MISCHIEVOUS_IMAGE_URL,
+		};
+	const radiantImage: ForecastImageRef = forecastImages?.radiant ?? {
+		kind: "external",
+		url: forecast.radiantImageUrl ?? DEFAULT_RADIANT_IMAGE_URL,
+	};
+
+	const mischievousColumn: BlockObjectRequest[] = [
+		paragraphHeading("If All Goes Poorly", "heading_2", "red"),
+		forecastImageBlock(mischievousImage),
+		...splitParagraphs(forecast.mischievousReading).map((p) =>
+			quote(p, "red"),
+		),
+	];
+
+	const radiantColumn: BlockObjectRequest[] = [
+		paragraphHeading("If All Goes Amazingly", "heading_2", "blue"),
+		forecastImageBlock(radiantImage),
+		...splitParagraphs(forecast.radiantReading).map((p) => quote(p, "blue")),
+	];
+
+	blocks.push(columnList([mischievousColumn, radiantColumn]));
+
+	// Snapshot — the shared factual preamble. Compact, contextual.
+	blocks.push(coloredCallout(forecast.snapshot, "📍", "yellow_background"));
+
+	// Action heading + to-dos.
+	blocks.push(paragraphHeading("🔱 What to do right now", "heading_3"));
+	for (const item of forecast.fork) {
+		blocks.push(todo(`${item.action} — ${item.owner}, ${item.timing}`));
+	}
+
+	return blocks;
 }
 
 async function fetchGranolaNote(

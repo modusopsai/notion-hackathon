@@ -3,7 +3,7 @@
 	"version": "0.0.0",
 	"private": true,
 	"scripts": {
-		"build": "tsc",
+		"build": "tsc && node -e \"const fs=require('node:fs'); fs.rmSync('dist/images',{recursive:true,force:true}); fs.cpSync('src/images', 'dist/images', { recursive: true })\"",
 		"check": "tsc --noEmit"
 	},
 	"engines": {
