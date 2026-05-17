@@ -19,6 +19,10 @@ const GITHUB_ISSUES_PAGE_SIZE = 100;
 const GITHUB_DELTA_BUFFER_MS = 60_000;
 const GITHUB_NOTION_DATA_SOURCE_ID_DEFAULT =
 	"3623edae28d380cdafa7000b11385255";
+const GITHUB_CONTEXT_COMMENTS_LIMIT = 10;
+const GITHUB_CONTEXT_FILES_LIMIT = 50;
+const GITHUB_CONTEXT_COMMITS_LIMIT = 20;
+const GITHUB_CONTEXT_REVIEWS_LIMIT = 20;
 const GRANOLA_PAGE_SIZE = 30;
 const GRANOLA_DELTA_BUFFER_MS = 60_000;
 const GRANOLA_NOTION_DATA_SOURCE_ID_DEFAULT =
@@ -190,15 +194,25 @@ worker.tool<GithubIssuesNotionBackfillInput>("githubIssuesNotionBackfill", {
 			.string()
 			.nullable()
 			.describe("Optional ISO timestamp for GitHub's since filter."),
+		includeContext: j
+			.boolean()
+			.nullable()
+			.describe(
+				"When true or omitted, fetch issue/PR body, comments, and pull request context before writing.",
+			),
 	}),
 	execute: async (input, { notion }) => {
 		const page = input.page ?? 1;
 		const dryRun = input.dryRun ?? false;
+		const includeContext = input.includeContext ?? true;
 		const { issues, hasMore } = await fetchGithubIssuesPage({
 			page,
 			updatedSince: input.updatedSince ?? undefined,
 			usePacer: false,
 		});
+		const enrichedIssues = includeContext
+			? await enrichGithubIssues(issues, { usePacer: false })
+			: issues.map((issue) => ({ issue }));
 
 		if (dryRun) {
 			return {
@@ -212,9 +226,12 @@ worker.tool<GithubIssuesNotionBackfillInput>("githubIssuesNotionBackfill", {
 							dryRun,
 							page: page + 1,
 							updatedSince: input.updatedSince,
+							includeContext,
 						}
 					: null,
-				sample: issues[0] ? githubIssueNotionPreview(issues[0]) : null,
+				sample: enrichedIssues[0]
+					? githubIssueNotionPreview(enrichedIssues[0])
+					: null,
 			};
 		}
 
@@ -232,7 +249,7 @@ worker.tool<GithubIssuesNotionBackfillInput>("githubIssuesNotionBackfill", {
 		);
 
 		let upserted = 0;
-		for (const issue of issues) {
+		for (const issue of enrichedIssues) {
 			await upsertGithubIssuePage(notionClient, auth, dataSourceId, issue, schema);
 			upserted += 1;
 		}
@@ -248,6 +265,7 @@ worker.tool<GithubIssuesNotionBackfillInput>("githubIssuesNotionBackfill", {
 						dryRun,
 						page: page + 1,
 						updatedSince: input.updatedSince,
+						includeContext,
 					}
 				: null,
 			sample: null,
@@ -273,6 +291,7 @@ type GithubIssuesNotionBackfillInput = {
 	dryRun: boolean | null;
 	page: number | null;
 	updatedSince: string | null;
+	includeContext: boolean | null;
 };
 
 type SentrySyncState = {
@@ -324,6 +343,7 @@ type GitHubIssue = {
 	node_id?: string;
 	number: number;
 	title?: string;
+	body?: string | null;
 	state?: string;
 	state_reason?: string | null;
 	html_url?: string;
@@ -350,6 +370,76 @@ type GitHubIssue = {
 	pull_request?: {
 		html_url?: string;
 	};
+};
+
+type GitHubPullRequest = GitHubIssue & {
+	merged?: boolean;
+	draft?: boolean;
+	additions?: number;
+	deletions?: number;
+	changed_files?: number;
+	mergeable_state?: string | null;
+};
+
+type GitHubIssueComment = {
+	id?: number;
+	html_url?: string;
+	body?: string | null;
+	created_at?: string;
+	updated_at?: string;
+	user?: {
+		login?: string;
+	};
+};
+
+type GitHubPullRequestReview = {
+	id?: number;
+	html_url?: string;
+	state?: string;
+	body?: string | null;
+	submitted_at?: string;
+	user?: {
+		login?: string;
+	};
+};
+
+type GitHubPullRequestFile = {
+	filename?: string;
+	status?: string;
+	additions?: number;
+	deletions?: number;
+	changes?: number;
+	blob_url?: string;
+};
+
+type GitHubPullRequestCommit = {
+	sha?: string;
+	html_url?: string;
+	commit?: {
+		message?: string;
+		author?: {
+			name?: string;
+			date?: string;
+		};
+	};
+	author?: {
+		login?: string;
+	};
+};
+
+type GitHubIssueContext = {
+	detail?: GitHubIssue;
+	comments: GitHubIssueComment[];
+	pullRequest?: GitHubPullRequest;
+	reviews: GitHubPullRequestReview[];
+	files: GitHubPullRequestFile[];
+	commits: GitHubPullRequestCommit[];
+	syncedAt: string;
+};
+
+type EnrichedGitHubIssue = {
+	issue: GitHubIssue;
+	context?: GitHubIssueContext;
 };
 
 type GitHubWebhookPayload = {
@@ -380,6 +470,67 @@ type SentryIssue = {
 	firstSeen?: string;
 	lastSeen?: string;
 	permalink?: string;
+};
+
+type SentryTag = {
+	key?: string;
+	value?: string;
+};
+
+type SentryStackFrame = {
+	filename?: string;
+	absPath?: string;
+	function?: string;
+	module?: string;
+	lineno?: number;
+	colno?: number;
+	inApp?: boolean;
+};
+
+type SentryEvent = {
+	id?: string;
+	eventID?: string;
+	title?: string;
+	message?: string;
+	platform?: string;
+	type?: string;
+	culprit?: string;
+	location?: string | null;
+	dateCreated?: string;
+	dateReceived?: string;
+	timestamp?: string;
+	release?: string;
+	tags?: SentryTag[];
+	user?: JsonRecord | null;
+	context?: JsonRecord;
+	contexts?: JsonRecord;
+	metadata?: JsonRecord | null;
+	entries?: Array<{
+		type?: string;
+		data?: JsonRecord;
+	}>;
+};
+
+type SentryDebugContext = {
+	environment?: string;
+	release?: string;
+	transaction?: string;
+	platform?: string;
+	browser?: string;
+	os?: string;
+	runtime?: string;
+	latestEventId?: string;
+	latestEventTime?: string;
+	location?: string;
+	topStackFrame?: string;
+	tags?: string;
+	user?: string;
+	contextSummary?: string;
+	rawContext?: JsonRecord;
+};
+
+type EnrichedSentryIssue = NormalizedSentryIssue & {
+	debug?: SentryDebugContext;
 };
 
 type NormalizedSentryIssue = Required<Pick<SentryIssue, "id">> &
@@ -586,7 +737,13 @@ worker.webhook("githubIssuesWebhook", {
 				continue;
 			}
 
-			await upsertGithubIssuePage(notionClient, auth, dataSourceId, issue, schema);
+			await upsertGithubIssuePage(
+				notionClient,
+				auth,
+				dataSourceId,
+				await enrichGithubIssue(issue, { usePacer: false }),
+				schema,
+			);
 		}
 	},
 });
@@ -697,6 +854,7 @@ worker.sync("sentryIssuesSync", {
 			auth,
 			requireAnyEnv("SENTRY_NOTION_DATABASE_ID", "NOTION_SENTRY_DATABASE_ID"),
 		);
+		await ensureSentryNotionSchema(notionClient, auth, dataSourceId);
 		const url = new URL(
 			`https://sentry.io/api/0/organizations/${encodeURIComponent(orgSlug)}/issues/`,
 		);
@@ -728,7 +886,16 @@ worker.sync("sentryIssuesSync", {
 				: issues;
 
 		for (const issue of filteredIssues) {
-			await upsertSentryIssuePage(notionClient, auth, dataSourceId, issue);
+			const debug = await fetchSentryIssueDebugContext(
+				orgSlug,
+				issue.id,
+				token,
+				undefined,
+			);
+			await upsertSentryIssuePage(notionClient, auth, dataSourceId, {
+				...issue,
+				debug,
+			});
 		}
 
 		return {
@@ -771,6 +938,145 @@ async function fetchGithubIssuesPage(options: {
 		issues: (await response.json()) as GitHubIssue[],
 		hasMore: hasNextRel(response.headers.get("link")),
 	};
+}
+
+async function enrichGithubIssues(
+	issues: GitHubIssue[],
+	options: { usePacer?: boolean } = {},
+): Promise<EnrichedGitHubIssue[]> {
+	const enriched: EnrichedGitHubIssue[] = [];
+	for (const issue of issues) {
+		enriched.push(await enrichGithubIssue(issue, options));
+	}
+
+	return enriched;
+}
+
+async function enrichGithubIssue(
+	issue: GitHubIssue,
+	options: { usePacer?: boolean } = {},
+): Promise<EnrichedGitHubIssue> {
+	const context = await fetchGithubIssueContext(issue, options);
+	return { issue, context };
+}
+
+async function fetchGithubIssueContext(
+	issue: GitHubIssue,
+	options: { usePacer?: boolean } = {},
+): Promise<GitHubIssueContext> {
+	const owner = process.env.GITHUB_OWNER ?? GITHUB_OWNER_DEFAULT;
+	const repo = process.env.GITHUB_REPO ?? GITHUB_REPO_DEFAULT;
+	const syncedAt = new Date().toISOString();
+	const context: GitHubIssueContext = {
+		comments: [],
+		reviews: [],
+		files: [],
+		commits: [],
+		syncedAt,
+	};
+
+	context.detail = await fetchGithubJson<GitHubIssue>(
+		`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${issue.number}`,
+		`GitHub issue #${issue.number}`,
+		options,
+	);
+
+	const commentsLimit = githubContextLimit(
+		"GITHUB_CONTEXT_COMMENTS_LIMIT",
+		GITHUB_CONTEXT_COMMENTS_LIMIT,
+	);
+	if (commentsLimit > 0) {
+		context.comments = await fetchGithubJson<GitHubIssueComment[]>(
+			githubLimitedUrl(
+				`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${issue.number}/comments`,
+				commentsLimit,
+			),
+			`GitHub comments for #${issue.number}`,
+			options,
+		);
+	}
+
+	if (!issue.pull_request) {
+		return context;
+	}
+
+	context.pullRequest = await fetchGithubJson<GitHubPullRequest>(
+		`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${issue.number}`,
+		`GitHub pull request #${issue.number}`,
+		options,
+	);
+
+	const filesLimit = githubContextLimit(
+		"GITHUB_CONTEXT_FILES_LIMIT",
+		GITHUB_CONTEXT_FILES_LIMIT,
+	);
+	if (filesLimit > 0) {
+		context.files = await fetchGithubJson<GitHubPullRequestFile[]>(
+			githubLimitedUrl(
+				`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${issue.number}/files`,
+				filesLimit,
+			),
+			`GitHub pull request files for #${issue.number}`,
+			options,
+		);
+	}
+
+	const commitsLimit = githubContextLimit(
+		"GITHUB_CONTEXT_COMMITS_LIMIT",
+		GITHUB_CONTEXT_COMMITS_LIMIT,
+	);
+	if (commitsLimit > 0) {
+		context.commits = await fetchGithubJson<GitHubPullRequestCommit[]>(
+			githubLimitedUrl(
+				`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${issue.number}/commits`,
+				commitsLimit,
+			),
+			`GitHub pull request commits for #${issue.number}`,
+			options,
+		);
+	}
+
+	const reviewsLimit = githubContextLimit(
+		"GITHUB_CONTEXT_REVIEWS_LIMIT",
+		GITHUB_CONTEXT_REVIEWS_LIMIT,
+	);
+	if (reviewsLimit > 0) {
+		context.reviews = await fetchGithubJson<GitHubPullRequestReview[]>(
+			githubLimitedUrl(
+				`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${issue.number}/reviews`,
+				reviewsLimit,
+			),
+			`GitHub pull request reviews for #${issue.number}`,
+			options,
+		);
+	}
+
+	return context;
+}
+
+async function fetchGithubJson<T>(
+	url: string,
+	description: string,
+	options: { usePacer?: boolean } = {},
+): Promise<T> {
+	if (options.usePacer !== false) {
+		await githubApi.wait();
+	}
+	const response = await fetch(url, {
+		headers: githubHeaders(requireEnv("GITHUB_TOKEN")),
+	});
+	await assertOk(response, description);
+	return (await response.json()) as T;
+}
+
+function githubLimitedUrl(url: string, limit: number): string {
+	const limitedUrl = new URL(url);
+	limitedUrl.searchParams.set("per_page", String(limit));
+	return limitedUrl.toString();
+}
+
+function githubContextLimit(envName: string, fallback: number): number {
+	return readIntegerEnv(envName, fallback, 0, 100);
 }
 
 function githubHeaders(token: string): Record<string, string> {
@@ -816,7 +1122,7 @@ function githubIssueChange(issue: GitHubIssue) {
 			"Repo Full Name": Builder.richText(repoFullName),
 		},
 		upstreamUpdatedAt: issue.updated_at,
-		pageContentMarkdown: githubIssueMarkdown(issue, repoFullName, type, url),
+		pageContentMarkdown: githubIssueMarkdown({ issue }, repoFullName, type, url),
 	};
 }
 
@@ -828,13 +1134,23 @@ function formatGithubLabels(labels: GitHubIssue["labels"]): string {
 }
 
 function githubIssueMarkdown(
-	issue: GitHubIssue,
+	enrichedIssue: EnrichedGitHubIssue,
 	repoFullName: string,
 	type: string,
 	url: string | undefined,
 ): string {
-	return [
+	const { issue, context } = enrichedIssue;
+	const detail = context?.pullRequest ?? context?.detail ?? issue;
+	const pullRequest = context?.pullRequest;
+	const body = detail.body?.trim();
+	const lines = [
 		`# ${issue.title ?? `${type} #${issue.number}`}`,
+		"",
+		"## Summary",
+		"",
+		body ? toBoundedMarkdown(body, 8000) : "No description provided.",
+		"",
+		"## Metadata",
 		"",
 		`- Type: ${type}`,
 		`- Repo: ${repoFullName}`,
@@ -852,8 +1168,126 @@ function githubIssueMarkdown(
 		`- Created: ${issue.created_at ?? "Unknown"}`,
 		`- Updated: ${issue.updated_at ?? "Unknown"}`,
 		`- Closed: ${issue.closed_at ?? "Open"}`,
+		`- Comments: ${issue.comments ?? 0}`,
+		`- Locked: ${issue.locked ? "Yes" : "No"}`,
+		...(context?.syncedAt ? [`- Context synced: ${context.syncedAt}`] : []),
 		`- Source: ${url ?? "Unavailable"}`,
+	];
+
+	if (pullRequest) {
+		lines.push(
+			"",
+			"## PR Details",
+			"",
+			`- Merged: ${pullRequest.merged ? "Yes" : "No"}`,
+			`- Draft: ${pullRequest.draft ? "Yes" : "No"}`,
+			`- Mergeable state: ${pullRequest.mergeable_state ?? "Unknown"}`,
+			`- Changed files: ${pullRequest.changed_files ?? 0}`,
+			`- Additions: ${pullRequest.additions ?? 0}`,
+			`- Deletions: ${pullRequest.deletions ?? 0}`,
+		);
+	}
+
+	if (context?.comments.length) {
+		lines.push("", "## Recent Discussion", "");
+		for (const comment of context.comments) {
+			lines.push(formatGithubCommentMarkdown(comment));
+		}
+	}
+
+	if (context?.files.length) {
+		lines.push("", "## Changed Files", "");
+		for (const file of context.files) {
+			lines.push(
+				`- ${file.filename ?? "Unknown file"} (${file.status ?? "unknown"}, +${file.additions ?? 0}/-${file.deletions ?? 0}, ${file.changes ?? 0} changes)`,
+			);
+		}
+	}
+
+	if (context?.commits.length) {
+		lines.push("", "## Commits", "");
+		for (const commit of context.commits) {
+			lines.push(formatGithubCommitMarkdown(commit));
+		}
+	}
+
+	if (context?.reviews.length) {
+		lines.push("", "## Reviews", "");
+		for (const review of context.reviews) {
+			lines.push(formatGithubReviewMarkdown(review));
+		}
+	}
+
+	lines.push(
+		"",
+		"## Links",
+		"",
+		`- GitHub: ${url ?? "Unavailable"}`,
+	);
+
+	return toBoundedMarkdown(lines.join("\n"), 60000);
+}
+
+function formatGithubCommentMarkdown(comment: GitHubIssueComment): string {
+	const author = comment.user?.login ?? "Unknown";
+	const updated = comment.updated_at ?? comment.created_at ?? "Unknown time";
+	const body = comment.body?.trim()
+		? toBoundedMarkdown(comment.body.trim(), 2000)
+		: "No comment body.";
+
+	return [
+		`### ${author} at ${updated}`,
+		"",
+		body,
+		comment.html_url ? `\n${comment.html_url}` : "",
+		"",
 	].join("\n");
+}
+
+function formatGithubCommitMarkdown(commit: GitHubPullRequestCommit): string {
+	const sha = commit.sha ? commit.sha.slice(0, 7) : "unknown";
+	const message = firstLine(commit.commit?.message ?? "No commit message");
+	const author =
+		commit.author?.login ?? commit.commit?.author?.name ?? "Unknown author";
+	const date = commit.commit?.author?.date ?? "Unknown date";
+	const link = commit.html_url ? ` ${commit.html_url}` : "";
+	return `- \`${sha}\` ${message} by ${author} at ${date}${link}`;
+}
+
+function formatGithubReviewMarkdown(review: GitHubPullRequestReview): string {
+	const author = review.user?.login ?? "Unknown";
+	const state = review.state ?? "UNKNOWN";
+	const submittedAt = review.submitted_at ?? "Unknown time";
+	const body = review.body?.trim()
+		? `\n\n${toBoundedMarkdown(review.body.trim(), 1200)}`
+		: "";
+	const link = review.html_url ? `\n\n${review.html_url}` : "";
+	return [`### ${state} by ${author} at ${submittedAt}`, body, link, ""].join(
+		"\n",
+	);
+}
+
+function githubReviewState(reviews: GitHubPullRequestReview[]): string {
+	const states = reviews
+		.map((review) => review.state)
+		.filter((state): state is string => Boolean(state));
+	if (states.length === 0) {
+		return "";
+	}
+
+	return states.slice(-5).join(", ");
+}
+
+function firstLine(value: string): string {
+	return value.split(/\r?\n/)[0]?.trim() ?? "";
+}
+
+function toBoundedMarkdown(content: string, maxLength = 12000): string {
+	if (content.length <= maxLength) {
+		return content;
+	}
+
+	return `${content.slice(0, maxLength - 26)}\n\n... truncated for Notion`;
 }
 
 type GithubNotionSchema = {
@@ -906,6 +1340,13 @@ async function ensureGithubNotionSchema(
 		"Closed Time": { date: {} },
 		URL: { url: {} },
 		"Repo Full Name": { rich_text: {} },
+		"Context Synced Time": { date: {} },
+		Merged: { checkbox: {} },
+		Draft: { checkbox: {} },
+		"Changed Files": { number: { format: "number" } },
+		Additions: { number: { format: "number" } },
+		Deletions: { number: { format: "number" } },
+		"Review State": { rich_text: {} },
 	})) {
 		if (!properties[name]) {
 			missingProperties[name] = config;
@@ -927,10 +1368,11 @@ async function upsertGithubIssuePage(
 	notion: NotionClientLike,
 	auth: string,
 	dataSourceId: string,
-	issue: GitHubIssue,
+	enrichedIssue: EnrichedGitHubIssue,
 	schema: GithubNotionSchema,
 ): Promise<void> {
-	const { properties, markdown } = toNotionGithubIssuePage(issue, schema);
+	const { issue } = enrichedIssue;
+	const { properties, markdown } = toNotionGithubIssuePage(enrichedIssue, schema);
 	const page = await findGithubIssuePage(notion, auth, dataSourceId, issue);
 
 	if (page) {
@@ -1004,14 +1446,16 @@ async function findGithubIssuePage(
 }
 
 function toNotionGithubIssuePage(
-	issue: GitHubIssue,
+	enrichedIssue: EnrichedGitHubIssue,
 	schema: GithubNotionSchema,
 ): { properties: Record<string, unknown>; markdown: string } {
+	const { issue, context } = enrichedIssue;
 	const owner = process.env.GITHUB_OWNER ?? GITHUB_OWNER_DEFAULT;
 	const repo = process.env.GITHUB_REPO ?? GITHUB_REPO_DEFAULT;
 	const repoFullName = `${owner}/${repo}`;
 	const type = issue.pull_request ? "Pull Request" : "Issue";
 	const url = issue.pull_request?.html_url ?? issue.html_url;
+	const pullRequest = context?.pullRequest;
 
 	return {
 		properties: {
@@ -1038,17 +1482,26 @@ function toNotionGithubIssuePage(
 			"Closed Time": notionDate(issue.closed_at ?? undefined),
 			URL: notionUrl(url),
 			"Repo Full Name": notionRichText(repoFullName),
+			"Context Synced Time": notionDate(context?.syncedAt),
+			Merged: notionCheckbox(Boolean(pullRequest?.merged)),
+			Draft: notionCheckbox(Boolean(pullRequest?.draft)),
+			"Changed Files": notionNumber(pullRequest?.changed_files ?? 0),
+			Additions: notionNumber(pullRequest?.additions ?? 0),
+			Deletions: notionNumber(pullRequest?.deletions ?? 0),
+			"Review State": notionRichText(githubReviewState(context?.reviews ?? [])),
 		},
-		markdown: githubIssueMarkdown(issue, repoFullName, type, url),
+		markdown: githubIssueMarkdown(enrichedIssue, repoFullName, type, url),
 	};
 }
 
 function githubIssueNotionPreview(
-	issue: GitHubIssue,
+	enrichedIssue: EnrichedGitHubIssue,
 ): Record<string, string | number | boolean | null> {
+	const { issue, context } = enrichedIssue;
 	const owner = process.env.GITHUB_OWNER ?? GITHUB_OWNER_DEFAULT;
 	const repo = process.env.GITHUB_REPO ?? GITHUB_REPO_DEFAULT;
 	const type = issue.pull_request ? "Pull Request" : "Issue";
+	const pullRequest = context?.pullRequest;
 
 	return {
 		source: "GitHub",
@@ -1061,6 +1514,17 @@ function githubIssueNotionPreview(
 		updatedAt: issue.updated_at ?? "",
 		url: issue.pull_request?.html_url ?? issue.html_url ?? "",
 		repoFullName: `${owner}/${repo}`,
+		contextSyncedAt: context?.syncedAt ?? null,
+		contextComments: context?.comments.length ?? 0,
+		contextFiles: context?.files.length ?? 0,
+		contextCommits: context?.commits.length ?? 0,
+		contextReviews: context?.reviews.length ?? 0,
+		merged: pullRequest?.merged ?? null,
+		draft: pullRequest?.draft ?? null,
+		changedFiles: pullRequest?.changed_files ?? 0,
+		additions: pullRequest?.additions ?? 0,
+		deletions: pullRequest?.deletions ?? 0,
+		reviewState: githubReviewState(context?.reviews ?? []),
 	};
 }
 
@@ -1225,7 +1689,7 @@ function requireSlackChannels(): SlackChannelConfig[] {
 	const channelIds = parseCsv(process.env.SLACK_CHANNEL_IDS);
 	if (channelIds.length === 0) {
 		throw new Error(
-			"SLACK_CHANNEL_IDS is required. Set it to comma-separated Slack channel IDs the app can read, for example C123,C456.",
+			"SLACK_CHANNEL_IDS is required. Set it to comma-separated Slack conversation IDs the app can read, for example C123,D123,G123.",
 		);
 	}
 
@@ -1319,6 +1783,9 @@ worker.webhook("sentryIssueAlertWebhook", {
 			auth,
 			databaseOrDataSourceId,
 		);
+		await ensureSentryNotionSchema(notionClient, auth, dataSourceId);
+		const token = requireEnv("SENTRY_AUTH_TOKEN");
+		const orgSlug = requireAnyEnv("SENTRY_ORG_SLUG", "SENTRY_ORG");
 
 		for (const event of events) {
 			verifySentryWebhookSignature(
@@ -1335,7 +1802,16 @@ worker.webhook("sentryIssueAlertWebhook", {
 				continue;
 			}
 
-			await upsertSentryIssuePage(notionClient, auth, dataSourceId, issue);
+			const debug = await fetchSentryIssueDebugContext(
+				orgSlug,
+				issue.id,
+				token,
+				objectValue(objectValue(event.body.data)?.event),
+			);
+			await upsertSentryIssuePage(notionClient, auth, dataSourceId, {
+				...issue,
+				debug,
+			});
 		}
 	},
 });
@@ -1386,11 +1862,89 @@ async function resolveDataSourceId(
 	return normalizedId;
 }
 
+async function ensureSentryNotionSchema(
+	notion: NotionClientLike,
+	auth: string,
+	dataSourceId: string,
+): Promise<void> {
+	const dataSource = await notion.dataSources.retrieve({
+		auth,
+		data_source_id: dataSourceId,
+	});
+	const properties = objectValue(objectValue(dataSource)?.properties) ?? {};
+	const missingProperties: Record<string, unknown> = {};
+
+	for (const [name, config] of Object.entries({
+		Environment: { rich_text: {} },
+		Release: { rich_text: {} },
+		Transaction: { rich_text: {} },
+		Platform: { rich_text: {} },
+		Browser: { rich_text: {} },
+		OS: { rich_text: {} },
+		Runtime: { rich_text: {} },
+		"Latest Event ID": { rich_text: {} },
+		"Latest Event Time": { date: {} },
+		Location: { rich_text: {} },
+		"Top Stack Frame": { rich_text: {} },
+		Tags: { rich_text: {} },
+		User: { rich_text: {} },
+		"Context Summary": { rich_text: {} },
+	})) {
+		if (!properties[name]) {
+			missingProperties[name] = config;
+		}
+	}
+
+	if (Object.keys(missingProperties).length > 0) {
+		await notion.dataSources.update({
+			auth,
+			data_source_id: dataSourceId,
+			properties: missingProperties,
+		});
+	}
+}
+
+async function fetchSentryIssueDebugContext(
+	orgSlug: string,
+	issueId: string,
+	token: string,
+	webhookEvent: JsonRecord | undefined,
+): Promise<SentryDebugContext | undefined> {
+	if (webhookEvent) {
+		return sentryDebugContextFromEvent(webhookEvent);
+	}
+
+	const url = new URL(
+		`https://sentry.io/api/0/organizations/${encodeURIComponent(orgSlug)}/issues/${encodeURIComponent(issueId)}/events/`,
+	);
+	url.searchParams.set("full", "true");
+
+	try {
+		await sentryApi.wait();
+		const events = await fetchJson<SentryEvent[]>(
+			url,
+			{
+				headers: {
+					Authorization: `Bearer ${token}`,
+				},
+			},
+			`Sentry issue ${issueId} events`,
+		);
+		return sentryDebugContextFromEvent(objectValue(events[0]));
+	} catch (error) {
+		console.log(
+			`Could not enrich Sentry issue ${issueId}; writing base issue fields only.`,
+			error instanceof Error ? error.message : error,
+		);
+		return undefined;
+	}
+}
+
 async function upsertSentryIssuePage(
 	notion: NotionClientLike,
 	auth: string,
 	dataSourceId: string,
-	issue: NormalizedSentryIssue,
+	issue: EnrichedSentryIssue,
 ): Promise<void> {
 	const properties = toNotionSentryProperties(issue);
 	const existing = await notion.dataSources.query({
@@ -1413,6 +1967,15 @@ async function upsertSentryIssuePage(
 			page_id: page.id,
 			properties,
 		});
+		await notion.pages.updateMarkdown({
+			auth,
+			page_id: page.id,
+			type: "replace_content",
+			replace_content: {
+				new_str: sentryIssueMarkdown(issue),
+				allow_deleting_content: true,
+			},
+		});
 		return;
 	}
 
@@ -1427,7 +1990,8 @@ async function upsertSentryIssuePage(
 	});
 }
 
-function toNotionSentryProperties(issue: NormalizedSentryIssue) {
+function toNotionSentryProperties(issue: EnrichedSentryIssue) {
+	const debug = issue.debug;
 	return {
 		Issue: notionTitle(issue.title ?? `Sentry issue ${issue.id}`),
 		"Sentry Issue ID": notionRichText(issue.id),
@@ -1440,6 +2004,20 @@ function toNotionSentryProperties(issue: NormalizedSentryIssue) {
 		"First Seen": notionDate(issue.firstSeen),
 		"Last Seen": notionDate(issue.lastSeen),
 		Permalink: notionUrl(issue.permalink),
+		Environment: notionRichText(debug?.environment ?? ""),
+		Release: notionRichText(debug?.release ?? ""),
+		Transaction: notionRichText(debug?.transaction ?? ""),
+		Platform: notionRichText(debug?.platform ?? ""),
+		Browser: notionRichText(debug?.browser ?? ""),
+		OS: notionRichText(debug?.os ?? ""),
+		Runtime: notionRichText(debug?.runtime ?? ""),
+		"Latest Event ID": notionRichText(debug?.latestEventId ?? ""),
+		"Latest Event Time": notionDate(debug?.latestEventTime),
+		Location: notionRichText(debug?.location ?? ""),
+		"Top Stack Frame": notionRichText(debug?.topStackFrame ?? ""),
+		Tags: notionRichText(debug?.tags ?? ""),
+		User: notionRichText(debug?.user ?? ""),
+		"Context Summary": notionRichText(debug?.contextSummary ?? ""),
 	};
 }
 
@@ -1614,6 +2192,220 @@ function normalizeSentryWebhookIssue(
 			eventPayload?.url,
 		),
 	};
+}
+
+function sentryDebugContextFromEvent(
+	event: JsonRecord | undefined,
+): SentryDebugContext | undefined {
+	if (!event) {
+		return undefined;
+	}
+
+	const tags = normalizeSentryTags(event.tags);
+	const contexts = objectValue(event.contexts) ?? objectValue(event.context);
+	const browserContext = objectValue(contexts?.browser);
+	const osContext = objectValue(contexts?.os);
+	const runtimeContext = objectValue(contexts?.runtime);
+	const traceContext = objectValue(contexts?.trace);
+	const user = objectValue(event.user);
+	const topFrame = sentryTopStackFrame(event);
+	const tagSummary = formatSentryTags(tags);
+	const contextSummary = formatSentryContextSummary(contexts);
+
+	return {
+		environment: getSentryTag(tags, "environment"),
+		release: firstString(event.release, getSentryTag(tags, "release")),
+		transaction: firstString(
+			getSentryTag(tags, "transaction"),
+			traceContext?.transaction,
+		),
+		platform: firstString(event.platform),
+		browser: firstString(
+			getSentryTag(tags, "browser"),
+			browserContext?.name,
+			formatSentryContextName(browserContext),
+		),
+		os: firstString(
+			getSentryTag(tags, "os"),
+			osContext?.name,
+			formatSentryContextName(osContext),
+		),
+		runtime: firstString(
+			getSentryTag(tags, "runtime"),
+			runtimeContext?.name,
+			formatSentryContextName(runtimeContext),
+		),
+		latestEventId: firstString(event.eventID, event.event_id, event.id),
+		latestEventTime: firstString(
+			event.dateCreated,
+			event.dateReceived,
+			event.datetime,
+			event.timestamp,
+		),
+		location: firstString(event.location, topFrame?.location),
+		topStackFrame: topFrame?.summary,
+		tags: tagSummary,
+		user: formatSentryUser(user),
+		contextSummary,
+		rawContext: {
+			message: firstString(event.message, event.title),
+			exception: sentryExceptionSummary(event),
+			tags,
+			contexts,
+			metadata: objectValue(event.metadata),
+		},
+	};
+}
+
+function normalizeSentryTags(value: unknown): SentryTag[] {
+	if (Array.isArray(value)) {
+		return value
+			.map((tag) => {
+				const record = objectValue(tag);
+				return record
+					? {
+							key: stringValue(record.key),
+							value: stringValue(record.value),
+						}
+					: undefined;
+			})
+			.filter(
+				(tag): tag is { key: string; value: string } => Boolean(tag?.key),
+			);
+	}
+
+	const record = objectValue(value);
+	return Object.entries(record ?? {}).map(([key, tagValue]) => ({
+		key,
+		value: stringValue(tagValue),
+	}));
+}
+
+function getSentryTag(tags: SentryTag[], key: string): string | undefined {
+	return tags.find((tag) => tag.key === key)?.value;
+}
+
+function formatSentryTags(tags: SentryTag[]): string {
+	return tags
+		.filter((tag) => tag.key && tag.value)
+		.map((tag) => `${tag.key}: ${tag.value}`)
+		.join("\n");
+}
+
+function formatSentryContextName(context: JsonRecord | undefined): string {
+	return compact([
+		stringValue(context?.name),
+		stringValue(context?.version),
+		stringValue(context?.raw_description),
+	]).join(" ");
+}
+
+function formatSentryContextSummary(
+	contexts: JsonRecord | undefined,
+): string | undefined {
+	if (!contexts) {
+		return undefined;
+	}
+
+	return Object.entries(contexts)
+		.map(([name, context]) => {
+			const record = objectValue(context);
+			const label = formatSentryContextName(record);
+			return label ? `${name}: ${label}` : name;
+		})
+		.join("\n");
+}
+
+function formatSentryUser(user: JsonRecord | undefined): string {
+	if (!user) {
+		return "";
+	}
+
+	return compact([
+		stringValue(user.email),
+		stringValue(user.username),
+		stringValue(user.name),
+		stringValue(user.id),
+		stringValue(user.ip_address),
+	]).join(" | ");
+}
+
+function sentryTopStackFrame(
+	event: JsonRecord,
+): { summary: string; location: string } | undefined {
+	const frames = sentryStackFrames(event);
+	if (frames.length === 0) {
+		return undefined;
+	}
+
+	const frame =
+		[...frames].reverse().find((candidate) => candidate.inApp) ??
+		frames[frames.length - 1];
+	const location = compact([
+		frame.filename ?? frame.absPath,
+		frame.lineno ? String(frame.lineno) : undefined,
+		frame.colno ? String(frame.colno) : undefined,
+	]).join(":");
+	const summary = compact([
+		frame.function,
+		location,
+		frame.module ? `(${frame.module})` : undefined,
+	]).join(" ");
+
+	return {
+		summary: summary || location,
+		location,
+	};
+}
+
+function sentryStackFrames(event: JsonRecord): SentryStackFrame[] {
+	const entries = arrayValue(event.entries);
+	const exceptionEntry = entries
+		.map(objectValue)
+		.find((entry) => stringValue(entry?.type) === "exception");
+	const exceptionData = objectValue(exceptionEntry?.data);
+	const values = arrayValue(exceptionData?.values);
+	const frames: SentryStackFrame[] = [];
+
+	for (const value of values) {
+		const stacktrace = objectValue(objectValue(value)?.stacktrace);
+		for (const frameValue of arrayValue(stacktrace?.frames)) {
+			const frame = objectValue(frameValue);
+			if (!frame) {
+				continue;
+			}
+			frames.push({
+				filename: firstString(frame.filename, frame.filename_abs),
+				absPath: firstString(frame.abs_path, frame.absPath),
+				function: firstString(frame.function, frame.function_name),
+				module: firstString(frame.module),
+				lineno: numberValue(frame.lineno),
+				colno: numberValue(frame.colno),
+				inApp: Boolean(frame.in_app ?? frame.inApp),
+			});
+		}
+	}
+
+	return frames;
+}
+
+function sentryExceptionSummary(event: JsonRecord): string {
+	const entries = arrayValue(event.entries);
+	const exceptionEntry = entries
+		.map(objectValue)
+		.find((entry) => stringValue(entry?.type) === "exception");
+	const values = arrayValue(objectValue(exceptionEntry?.data)?.values);
+	const summaries = values
+		.map((value) => {
+			const exception = objectValue(value);
+			return compact([
+				stringValue(exception?.type),
+				stringValue(exception?.value),
+			]).join(": ");
+		})
+		.filter(Boolean);
+
+	return summaries.join("\n");
 }
 
 worker.sync("granolaNotesBackfill", {
@@ -2201,23 +2993,62 @@ function githubEventMarkdown(
 	].join("\n");
 }
 
-function sentryIssueMarkdown(issue: SentryIssue): string {
+function sentryIssueMarkdown(issue: EnrichedSentryIssue): string {
+	const debug = issue.debug;
 	return [
 		`# ${issue.title ?? `Sentry issue ${issue.id}`}`,
+		"",
+		"## Overview",
 		"",
 		`- Status: ${issue.status ?? "Unknown"}`,
 		`- Level: ${issue.level ?? "Unknown"}`,
 		`- Project: ${issue.project?.slug ?? issue.project?.name ?? "Unknown"}`,
+		`- Environment: ${debug?.environment ?? "Unknown"}`,
+		`- Release: ${debug?.release ?? "Unknown"}`,
+		`- Transaction: ${debug?.transaction ?? "Unknown"}`,
 		`- Users: ${toNumber(issue.userCount)}`,
 		`- Events: ${toNumber(issue.count)}`,
 		`- First seen: ${issue.firstSeen ?? "Unknown"}`,
 		`- Last seen: ${issue.lastSeen ?? "Unknown"}`,
+		`- Latest event: ${debug?.latestEventId ?? "Unknown"}`,
 		`- Source: ${issue.permalink ?? "Unavailable"}`,
 		"",
-		"## Culprit",
+		"## Failure Context",
 		"",
-		issue.culprit ?? "Unavailable",
+		`- Culprit: ${issue.culprit ?? "Unavailable"}`,
+		`- Location: ${debug?.location ?? "Unavailable"}`,
+		`- Top stack frame: ${debug?.topStackFrame ?? "Unavailable"}`,
+		"",
+		sentryExceptionSummaryFromDebug(debug) || "No exception summary available.",
+		"",
+		"## Runtime Context",
+		"",
+		`- Platform: ${debug?.platform ?? "Unknown"}`,
+		`- Browser: ${debug?.browser ?? "Unknown"}`,
+		`- OS: ${debug?.os ?? "Unknown"}`,
+		`- Runtime: ${debug?.runtime ?? "Unknown"}`,
+		`- User: ${debug?.user ?? "Unknown"}`,
+		"",
+		"## Tags",
+		"",
+		debug?.tags || "No tags available.",
+		"",
+		"## Context Summary",
+		"",
+		debug?.contextSummary || "No context summary available.",
+		"",
+		"## Raw Context Excerpt",
+		"",
+		"```json",
+		toBoundedJson(debug?.rawContext ?? {}, 4000),
+		"```",
 	].join("\n");
+}
+
+function sentryExceptionSummaryFromDebug(
+	debug: SentryDebugContext | undefined,
+): string {
+	return stringValue(objectValue(debug?.rawContext)?.exception);
 }
 
 function granolaNoteMarkdown(note: GranolaNote, actionItems: string): string {
@@ -2366,6 +3197,15 @@ function stringValue(value: unknown): string {
 	}
 
 	return "";
+}
+
+function numberValue(value: unknown): number | undefined {
+	if (typeof value === "number" && Number.isFinite(value)) {
+		return value;
+	}
+
+	const parsed = Number(value);
+	return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 function objectValue(value: unknown): JsonRecord | undefined {
