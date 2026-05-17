@@ -1,4 +1,6 @@
 import crypto from "node:crypto";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import {
 	Worker,
 	RateLimitError,
@@ -37,6 +39,12 @@ const GRANOLA_NOTION_DATA_SOURCE_ID_DEFAULT =
 	"3623edae-28d3-8095-958c-000b712611af";
 const SLACK_HISTORY_PAGE_SIZE = 15;
 const SLACK_DELTA_BUFFER_MS = 60_000;
+// The company Wiki database lives natively in Notion (not synced by this
+// worker). The readWiki tool queries it directly so the Custom Agent can
+// compare documented intent (PRDs, Feature Specs, ADRs, Runbooks) against
+// observed execution (commits, errors, meetings, messages).
+const WIKI_NOTION_DATA_SOURCE_ID_DEFAULT =
+	"3633edae-28d3-8028-b316-000bc8522720";
 
 const githubApi = worker.pacer("githubApi", {
 	allowedRequests: 10,
@@ -3410,6 +3418,7 @@ type ThemeSources = {
 	sentry: string[] | null;
 	granola: string[] | null;
 	slack: string[] | null;
+	wiki: string[] | null;
 };
 
 type Theme = {
@@ -3433,17 +3442,34 @@ type Divergence = {
 	whatToCheck: string | null;
 };
 
+type ForkItem = {
+	action: string;
+	owner: string;
+	timing: string;
+};
+
+type Forecast = {
+	dramaticEpigraph: string | null;
+	snapshot: string;
+	mischievousReading: string;
+	radiantReading: string;
+	fork: ForkItem[];
+	mischievousImageUrl: string | null;
+	radiantImageUrl: string | null;
+};
+
 const SOURCE_LABELS: Array<{ key: keyof ThemeSources; label: string }> = [
 	{ key: "github", label: "GitHub" },
 	{ key: "sentry", label: "Sentry" },
 	{ key: "granola", label: "Granola" },
 	{ key: "slack", label: "Slack" },
+	{ key: "wiki", label: "Wiki" },
 ];
 
 worker.tool("createSynthesis", {
 	title: "Create Synthesis Page",
 	description:
-		"Publish a Notion synthesis page that names the implicit roadmap a team is building, by triangulating four Notion-synced sources (GitHub commits/PRs, Sentry issues, Granola meeting notes, Slack messages). The Custom Agent reads those databases directly, clusters cross-source signals into themes, names the divergences across sources, and calls this tool with the result. This tool only renders the page; it does no reasoning.",
+		"Publish a Notion synthesis page that names the implicit roadmap a team is building, by triangulating five sources: four Notion-synced execution streams (GitHub commits/PRs, Sentry issues, Granola meeting notes, Slack messages) plus the company Wiki (PRDs, Feature Specs, ADRs, Product Decision Records, Runbooks — the documented intent). The Custom Agent reads those sources directly, clusters cross-source signals into themes, names the divergences (especially intent-vs-execution gaps where the Wiki says one thing and execution shows another), and calls this tool with the result. This tool only renders the page; it does no reasoning.",
 	schema: j.object({
 		overview: j
 			.string()
@@ -3512,6 +3538,12 @@ worker.tool("createSynthesis", {
 									"Pre-formatted bullets for relevant Slack messages. Format: '#eng-auth: 3 messages this week mentioning OAuth'.",
 								)
 								.nullable(),
+							wiki: j
+								.array(j.string())
+								.describe(
+									"Pre-formatted bullets for relevant Wiki pages (PRDs, Feature Specs, ADRs, Runbooks, Product/Engineering docs). Format: 'Feature Spec: Onboarding and Checkout (Draft) — names auth changes not yet in code' or 'Runbook: Sentry Triage — defines expected response to the OAuth alert climb'. Use this to surface intent-vs-execution gaps: documented expectations that reality is or isn't matching.",
+								)
+								.nullable(),
 						})
 						.describe(
 							"Per-source supporting evidence. Pass null (not an empty array) for sources that have no signal for this theme.",
@@ -3571,6 +3603,67 @@ worker.tool("createSynthesis", {
 				"Top-level mismatches between sources. This is the lean-forward beat of the synthesis: things the work isn't matching the talk, or vice versa.",
 			)
 			.nullable(),
+		forecast: j
+			.object({
+				dramaticEpigraph: j
+					.string()
+					.describe(
+						"Optional one-line dramatic quote rendered as a banner above the fork diagram. Should land between portentous and tongue-in-cheek — think Dante's 'Abandon all hope, ye who enter here' energy but specific to this synthesis. Reference what's actually in the snapshot. Under 15 words. Pass null to skip.",
+					)
+					.nullable(),
+				snapshot: j
+					.string()
+					.describe(
+						"Two to three sentences of factual current state across the most active workstreams. Prose, not bullets. Specific numbers where the evidence supports them. This is the unified preamble both readings work from.",
+					),
+				mischievousReading: j
+					.string()
+					.describe(
+						"Exactly four short paragraphs (separated by blank lines) in the voice of a slightly seductive observer delighted by patterns of dysfunction. Stepped detail across paragraphs, matching the four hell-path milestones in the fork diagram. Paragraph 1 — Weeks (friction): the next 1-2 weeks, grounded, specific, plausibly accurate, what a senior engineer would nod at. Paragraph 2 — Months (drift): the next 1-2 months, slightly zoomed out but still concrete, patterns of avoidance and re-debate. Paragraph 3 — Quarter (haunted): comic-grotesque register — haunted branches, sole maintainers muttering, words nobody says anymore. Paragraph 4 — Year-end (Inferno): minimal detail, maximum theme, folkloric and mythological. Reference items by name throughout. Mention dysfunction types (unwritten, unowned, drifting, single-author, oscillating, dropped) sparingly — at most three across both readings combined. NEVER accuse a named person of a character flaw — predict systems failing, not people.",
+					),
+				radiantReading: j
+					.string()
+					.describe(
+						"Exactly four short paragraphs (separated by blank lines) in the voice of a gracious observer seeing the version where small interventions land. Stepped detail matching the four heaven-path milestones: Weeks (clarity), Months (cadence), Quarter (blessed), Year-end (Paradiso). Address the same items as the Mischievous Reading, by name. Each prediction grounded in a reachable action by a specific actor on a specific timing. Never preachy. Long-horizon register: rapturous (ADRs becoming legend, new engineers weeping with gratitude, the codebase reads like scripture).",
+					),
+				fork: j
+					.array(
+						j.object({
+							action: j
+								.string()
+								.describe(
+									"The intervention. Under 20 words. Verb-led and specific.",
+								),
+							owner: j
+								.string()
+								.describe('Named person, or "needs an owner".'),
+							timing: j
+								.string()
+								.describe(
+									'Specific timing such as "by Tuesday", "this week", or "before next standup".',
+								),
+						}),
+					)
+					.describe(
+						"Three to five concrete interventions that make the Radiant Reading manifest. Each specific enough to put on a calendar.",
+					),
+				mischievousImageUrl: j
+					.string()
+					.describe(
+						"Optional public image URL to show alongside the Mischievous Reading. Defaults to a Gustave Doré Inferno illustration. Use any public-domain, GIF, or workplace-safe image URL you like.",
+					)
+					.nullable(),
+				radiantImageUrl: j
+					.string()
+					.describe(
+						"Optional public image URL to show alongside the Radiant Reading. Defaults to a Gustave Doré Paradiso illustration.",
+					)
+					.nullable(),
+			})
+			.describe(
+				"Optional heaven/hell forecast. The snapshot is shared between both readings. Both readings escalate from grounded near-term to mythological long-term. Pass null to omit the entire forecast section.",
+			)
+			.nullable(),
 		title: j
 			.string()
 			.describe(
@@ -3591,14 +3684,35 @@ worker.tool("createSynthesis", {
 		divergenceCount: j.number(),
 	}),
 	execute: async (
-		{ overview, themes, divergences, title, windowDescription },
+		{ overview, themes, divergences, forecast, title, windowDescription },
 		{ notion },
 	) => {
 		const parentPageId = requireEnv("SYNTHESIS_PARENT_PAGE_ID");
-		const pageTitle =
-			title ?? `Synthesis - ${new Date().toISOString().replace(/\..+$/, "Z")}`;
+		const pageTitle = title ?? defaultSynthesisTitle();
 		const window = windowDescription ?? "the recent window";
 		const divergenceList = divergences ?? [];
+
+		// If a forecast is provided, resolve the two reading images. By default
+		// we upload the bundled heaven.gif / hell.gif via Notion file uploads;
+		// the agent can override per-call with mischievousImageUrl / radiantImageUrl.
+		let forecastImages: ForecastImages | null = null;
+		if (forecast) {
+			const [mischievous, radiant] = await Promise.all([
+				resolveForecastImage(
+					notion,
+					forecast.mischievousImageUrl,
+					"hell.gif",
+					DEFAULT_MISCHIEVOUS_IMAGE_URL,
+				),
+				resolveForecastImage(
+					notion,
+					forecast.radiantImageUrl,
+					"heaven.gif",
+					DEFAULT_RADIANT_IMAGE_URL,
+				),
+			]);
+			forecastImages = { mischievous, radiant };
+		}
 
 		const page = await notion.pages.create({
 			parent: { page_id: parentPageId },
@@ -3613,6 +3727,8 @@ worker.tool("createSynthesis", {
 				themes,
 				divergenceList,
 				window,
+				forecast ?? null,
+				forecastImages,
 			),
 		});
 
@@ -3626,58 +3742,81 @@ worker.tool("createSynthesis", {
 });
 
 function synthesisBlocks(
-	pageTitle: string,
-	overview: string,
+	_pageTitle: string,
+	_overview: string,
 	themes: Theme[],
 	divergences: Divergence[],
-	windowDescription: string,
+	_windowDescription: string,
+	forecast: Forecast | null,
+	forecastImages: ForecastImages | null,
 ): BlockObjectRequest[] {
-	const blocks: BlockObjectRequest[] = [
-		paragraphHeading(pageTitle, "heading_1"),
-		paragraph(
-			`Synthesis of cross-source signals over ${windowDescription}. Themes are the implicit roadmap inferred from GitHub commits, Sentry issues, Granola meeting notes, and Slack messages. Divergences call out where the sources disagree. Claims are hedged where the evidence is thin.`,
-		),
-		callout(overview, "💡"),
-		divider(),
-	];
+	// Strong-edit layout:
+	//   1. Hero (always visible): epigraph, snapshot, mermaid, fork to-dos
+	//   2. Toggle h2: 😈 vs 😇 The Full Reading
+	//   3. Toggle h2: 🔍 Where the signals diverge
+	//   4. Toggle h2: 🗺 The implicit roadmap
+	// Page title renders automatically. We drop the page intro paragraph
+	// and the overview callout — the hero is the executive summary now.
+	const blocks: BlockObjectRequest[] = [];
+
+	if (forecast) {
+		blocks.push(...forecastHeroBlocks(forecast));
+		// Full Reading lives directly in the page (not behind a toggle) —
+		// the two voices are the centerpiece, exposed by default.
+		blocks.push(paragraphHeading("😈 vs 😇 The Full Reading", "heading_2"));
+		blocks.push(...forecastDeepInner(forecast, forecastImages));
+	}
 
 	if (divergences.length > 0) {
-		blocks.push(paragraphHeading("Where the signals diverge", "heading_2"));
 		blocks.push(
-			paragraph(
-				"Cross-source mismatches. These are the moments where what the team is talking about, breaking on, or merging doesn't line up.",
+			toggleHeading2(
+				"🔍 Where the signals diverge",
+				divergencesInner(divergences),
 			),
 		);
-		for (const d of divergences) {
-			const sources = (d.sources ?? []).filter(Boolean);
-			const tail = sources.length > 0 ? ` (${sources.join(" / ")})` : "";
-			blocks.push(bullet(`${d.observation}${tail}`));
-			if (d.hypothesis) {
-				blocks.push(paragraph(`  Hypothesis: ${d.hypothesis}`));
-			}
-			if (d.whatToCheck) {
-				blocks.push(paragraph(`  Worth checking: ${d.whatToCheck}`));
-			}
+	}
+
+	if (themes.length > 0) {
+		blocks.push(
+			toggleHeading2("🗺 The implicit roadmap", themesInner(themes)),
+		);
+	}
+
+	return blocks;
+}
+
+// Inner content for the divergences toggle. Each divergence is one bullet
+// with the observation; hypothesis and what-to-check become sub-bullets
+// underneath, kept compact.
+function divergencesInner(divergences: Divergence[]): BlockObjectRequest[] {
+	const blocks: BlockObjectRequest[] = [];
+	for (const d of divergences) {
+		const sources = (d.sources ?? []).filter(Boolean);
+		const tail = sources.length > 0 ? ` (${sources.join(" / ")})` : "";
+		const children: BlockObjectRequest[] = [];
+		if (d.hypothesis) {
+			children.push(bullet(`Hypothesis: ${d.hypothesis}`));
 		}
-		blocks.push(divider());
+		if (d.whatToCheck) {
+			children.push(bullet(`Worth checking: ${d.whatToCheck}`));
+		}
+		blocks.push(
+			bullet(
+				`${d.observation}${tail}`,
+				children.length > 0 ? children : undefined,
+			),
+		);
 	}
+	return blocks;
+}
 
-	if (themes.length === 0) {
-		blocks.push(paragraph("No themes were provided."));
-		return blocks;
-	}
-
-	blocks.push(paragraphHeading("The implicit roadmap", "heading_2"));
-	blocks.push(
-		paragraph(
-			"Each theme is one coherent line of work the data converges on, regardless of whether it appears on any stated plan.",
-		),
-	);
-
+// Inner content for the implicit roadmap toggle. Each theme becomes a
+// toggle-h3 of its own, so readers can open the one they care about
+// without unfurling everything.
+function themesInner(themes: Theme[]): BlockObjectRequest[] {
+	const blocks: BlockObjectRequest[] = [];
 	for (const theme of themes) {
-		blocks.push(paragraphHeading(theme.name, "heading_3"));
-
-		// Type · confidence · momentum
+		// Compact heading: name plus the at-a-glance attributes inline.
 		const headerParts: string[] = [`Type: ${theme.type}`];
 		if (typeof theme.confidence === "number") {
 			headerParts.push(`Confidence: ${theme.confidence.toFixed(2)}`);
@@ -3685,39 +3824,36 @@ function synthesisBlocks(
 		if (theme.momentum) {
 			headerParts.push(`Momentum: ${theme.momentum}`);
 		}
-		blocks.push(paragraph(headerParts.join("  ·  ")));
+		const heading = `${theme.name}  ·  ${headerParts.join("  ·  ")}`;
+
+		const themeBody: BlockObjectRequest[] = [];
 
 		if (theme.confidenceReasoning) {
-			blocks.push(
+			themeBody.push(
 				paragraph(`Confidence reasoning: ${theme.confidenceReasoning}`),
 			);
 		}
-
 		if (theme.summary) {
-			blocks.push(paragraph(theme.summary));
+			themeBody.push(paragraph(theme.summary));
 		}
-
 		if (theme.insight) {
-			blocks.push(callout(theme.insight, "🔍"));
+			themeBody.push(callout(theme.insight, "🔍"));
 		}
-
 		if (theme.stakeholders && theme.stakeholders.length > 0) {
-			blocks.push(
+			themeBody.push(
 				paragraph(`Stakeholders: ${theme.stakeholders.join(", ")}`),
 			);
 		}
-
 		if (theme.openQuestions && theme.openQuestions.length > 0) {
-			blocks.push(paragraph("Open questions:"));
+			themeBody.push(paragraph("Open questions:"));
 			for (const q of theme.openQuestions) {
-				blocks.push(bullet(q));
+				themeBody.push(bullet(q));
 			}
 		}
-
 		if (theme.counterEvidence && theme.counterEvidence.length > 0) {
-			blocks.push(paragraph("Counter-evidence:"));
+			themeBody.push(paragraph("Counter-evidence:"));
 			for (const c of theme.counterEvidence) {
-				blocks.push(bullet(c));
+				themeBody.push(bullet(c));
 			}
 		}
 
@@ -3725,21 +3861,23 @@ function synthesisBlocks(
 			const list = theme.sources?.[key];
 			return Array.isArray(list) && list.length > 0;
 		});
-
 		if (populatedSources.length > 0) {
-			blocks.push(paragraph("Supporting signals by source:"));
+			themeBody.push(paragraph("Supporting signals by source:"));
+			// Flat bullets only — Notion caps create-time nesting at 2 child
+			// levels, and we're already inside a toggle h2 + toggle h3. Use
+			// the label-then-items pattern with the label as a paragraph so
+			// the items still read like a grouped list.
 			for (const { key, label } of populatedSources) {
 				const items = (theme.sources[key] ?? []).filter(Boolean);
-				blocks.push(bullet(`${label} (${items.length}):`));
+				themeBody.push(paragraph(`${label} (${items.length}):`));
 				for (const item of items) {
-					blocks.push(bullet(`  ${item}`));
+					themeBody.push(bullet(item));
 				}
 			}
 		}
 
-		blocks.push(divider());
+		blocks.push(toggleHeading3(heading, themeBody));
 	}
-
 	return blocks;
 }
 
@@ -3993,8 +4131,8 @@ worker.tool("readGithubActivity", {
 	}),
 	execute: async ({ sinceDays, limit, types }, { notion }) => {
 		const dataSourceId = requireEnv("GITHUB_ACTIVITY_DATA_SOURCE_ID");
-		const lookback = Math.min(sinceDays ?? 14, 90);
-		const max = Math.min(limit ?? 30, 200);
+		const lookback = Math.min(sinceDays ?? 90, 90);
+		const max = Math.min(limit ?? 200, 200);
 		const since = new Date(
 			Date.now() - lookback * 86_400_000,
 		).toISOString();
@@ -4176,8 +4314,8 @@ worker.tool("readSentryIssues", {
 	}),
 	execute: async ({ sinceDays, limit, levels }, { notion }) => {
 		const dataSourceId = requireEnv("SENTRY_ISSUES_DATA_SOURCE_ID");
-		const lookback = Math.min(sinceDays ?? 30, 90);
-		const max = Math.min(limit ?? 30, 200);
+		const lookback = Math.min(sinceDays ?? 90, 90);
+		const max = Math.min(limit ?? 200, 200);
 		const since = new Date(
 			Date.now() - lookback * 86_400_000,
 		).toISOString();
@@ -4301,8 +4439,8 @@ worker.tool("readGranolaNotes", {
 	}),
 	execute: async ({ sinceDays, limit }, { notion }) => {
 		const dataSourceId = requireEnv("GRANOLA_NOTES_DATA_SOURCE_ID");
-		const lookback = Math.min(sinceDays ?? 30, 180);
-		const max = Math.min(limit ?? 20, 100);
+		const lookback = Math.min(sinceDays ?? 180, 180);
+		const max = Math.min(limit ?? 100, 100);
 		const since = new Date(
 			Date.now() - lookback * 86_400_000,
 		).toISOString();
@@ -4407,7 +4545,7 @@ worker.tool("readSlackMessages", {
 	}),
 	execute: async ({ limit }, { notion }) => {
 		const dataSourceId = requireEnv("SLACK_MESSAGES_DATA_SOURCE_ID");
-		const max = Math.min(limit ?? 50, 200);
+		const max = Math.min(limit ?? 200, 200);
 
 		const messages: Array<{
 			id: string;
@@ -4454,6 +4592,142 @@ worker.tool("readSlackMessages", {
 	},
 });
 
+// ---------- readWiki ------------------------------------------------------
+
+function wikiNotionTargetId(): string {
+	return (
+		process.env.WIKI_NOTION_DATA_SOURCE_ID ??
+		WIKI_NOTION_DATA_SOURCE_ID_DEFAULT
+	);
+}
+
+worker.tool("readWiki", {
+	title: "Read Wiki Pages",
+	description:
+		"Fetch wiki pages from the company Notion Wiki with full body markdown. Returns the documented intent of the team: PRDs, Feature Specs, ADRs, Product Decision Records, Runbooks, and other Product/Engineering/Operations documentation. Use this to compare documented expectations against observed execution (commits, errors, meetings, messages). The most valuable synthesis output is the gap between what these docs say should happen and what the other sources show actually happening.",
+	schema: j.object({
+		sinceDays: j
+			.number()
+			.describe(
+				"Look back N days by Last Updated. Defaults to 90, cap 365.",
+			)
+			.nullable(),
+		limit: j
+			.number()
+			.describe("Max pages to fetch. Defaults to 20, cap 100.")
+			.nullable(),
+		categories: j
+			.array(j.string())
+			.describe(
+				'Optional categories to filter to. Valid values: "Product", "Engineering", "Marketing", "Sales", "HR", "Operations", "Finance", "Legal". Defaults to all categories. For synthesis work, the most relevant are typically Product, Engineering, and Operations.',
+			)
+			.nullable(),
+	}),
+	outputSchema: j.object({
+		pages: j.array(
+			j.object({
+				id: j.string(),
+				title: j.string(),
+				category: j.string(),
+				status: j.string(),
+				priority: j.string(),
+				tags: j.string(),
+				owner: j.string(),
+				lastUpdated: j.string(),
+				webUrl: j.string(),
+				bodyMarkdown: j.string(),
+			}),
+		),
+		totalReturned: j.number(),
+	}),
+	execute: async ({ sinceDays, limit, categories }, { notion }) => {
+		const dataSourceId = wikiNotionTargetId();
+		const lookback = Math.min(sinceDays ?? 365, 365);
+		const max = Math.min(limit ?? 100, 100);
+		const since = new Date(
+			Date.now() - lookback * 86_400_000,
+		).toISOString();
+
+		const dateFilter = {
+			property: "Last Updated",
+			date: { on_or_after: since },
+		};
+
+		let combinedFilter: unknown = dateFilter;
+		if (categories && categories.length > 0) {
+			combinedFilter = {
+				and: [
+					dateFilter,
+					{
+						or: categories.map((cat) => ({
+							property: "Category",
+							select: { equals: cat },
+						})),
+					},
+				],
+			};
+		}
+
+		const pages: Array<{
+			id: string;
+			title: string;
+			category: string;
+			status: string;
+			priority: string;
+			tags: string;
+			owner: string;
+			lastUpdated: string;
+			webUrl: string;
+			bodyMarkdown: string;
+		}> = [];
+		let cursor: string | undefined;
+
+		while (pages.length < max) {
+			const response = await notion.dataSources.query({
+				data_source_id: dataSourceId,
+				filter: combinedFilter as never,
+				sorts: [{ property: "Last Updated", direction: "descending" }],
+				page_size: Math.min(100, max - pages.length),
+				start_cursor: cursor,
+			});
+
+			for (const page of response.results) {
+				const id = pageId(page);
+				if (!id) continue;
+				const properties = pageProperties(page);
+				if (!properties) continue;
+				const body = await readPageBody(notion, id);
+
+				pages.push({
+					id,
+					title: stringValue(queryPropertyValue(properties, "Title")),
+					category: stringValue(
+						queryPropertyValue(properties, "Category"),
+					),
+					status: stringValue(queryPropertyValue(properties, "Status")),
+					priority: stringValue(
+						queryPropertyValue(properties, "Priority"),
+					),
+					tags: stringValue(queryPropertyValue(properties, "Tags")),
+					owner: stringValue(queryPropertyValue(properties, "Owner")),
+					lastUpdated: stringValue(
+						queryPropertyValue(properties, "Last Updated"),
+					),
+					webUrl: (page as { url?: string }).url ?? "",
+					bodyMarkdown: body.markdown,
+				});
+
+				if (pages.length >= max) break;
+			}
+
+			if (!response.has_more || !response.next_cursor) break;
+			cursor = response.next_cursor;
+		}
+
+		return { pages, totalReturned: pages.length };
+	},
+});
+
 function paragraphHeading(
 	content: string,
 	level: "heading_1" | "heading_2" | "heading_3",
@@ -4489,12 +4763,18 @@ function paragraph(content: string): BlockObjectRequest {
 	};
 }
 
-function bullet(content: string): BlockObjectRequest {
+function bullet(
+	content: string,
+	children?: BlockObjectRequest[],
+): BlockObjectRequest {
 	return {
 		object: "block",
 		type: "bulleted_list_item",
 		bulleted_list_item: {
 			rich_text: [{ type: "text", text: { content } }],
+			...(children && children.length > 0
+				? { children: children as never }
+				: {}),
 		},
 	};
 }
@@ -4512,6 +4792,343 @@ function callout(content: string, emoji: string): BlockObjectRequest {
 
 function divider(): BlockObjectRequest {
 	return { object: "block", type: "divider", divider: {} };
+}
+
+// Default page title: "Two Roads — May 17, 2026". A nod to the two paths
+// the forecast section projects, with a plain-language date that's easier
+// to scan than an ISO timestamp.
+function defaultSynthesisTitle(): string {
+	const dateStr = new Date().toLocaleDateString("en-US", {
+		year: "numeric",
+		month: "long",
+		day: "numeric",
+	});
+	return `Two Roads — ${dateStr}`;
+}
+
+// ----------------------------------------------------------------------------
+// Forecast section helpers — the heaven/hell projection rendered after themes
+// ----------------------------------------------------------------------------
+
+// Gustave Doré illustrations from Dante's Divine Comedy. Public domain,
+// hosted on Wikimedia Commons. The agent can override these via the
+// mischievousImageUrl / radiantImageUrl fields in the forecast input.
+const DEFAULT_MISCHIEVOUS_IMAGE_URL =
+	"https://upload.wikimedia.org/wikipedia/commons/0/0a/Gustave_Dor%C3%A9_-_Dante_Alighieri_-_Inferno_-_Plate_65_%28Canto_XXXIV_-_Lucifer%29.jpg";
+
+const DEFAULT_RADIANT_IMAGE_URL =
+	"https://upload.wikimedia.org/wikipedia/commons/a/a0/Paradiso_Canto_31.jpg";
+
+type CalloutColor =
+	| "default"
+	| "gray_background"
+	| "brown_background"
+	| "orange_background"
+	| "yellow_background"
+	| "green_background"
+	| "blue_background"
+	| "purple_background"
+	| "pink_background"
+	| "red_background";
+
+type QuoteColor =
+	| "default"
+	| "gray"
+	| "brown"
+	| "orange"
+	| "yellow"
+	| "green"
+	| "blue"
+	| "purple"
+	| "pink"
+	| "red";
+
+function mermaidDiagram(content: string): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "code",
+		code: {
+			rich_text: [{ type: "text", text: { content } }],
+			language: "mermaid" as never,
+		},
+	};
+}
+
+function quote(content: string, color: QuoteColor = "default"): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "quote",
+		quote: {
+			rich_text: [{ type: "text", text: { content } }],
+			color,
+		},
+	};
+}
+
+function todo(content: string, checked = false): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "to_do",
+		to_do: {
+			rich_text: [{ type: "text", text: { content } }],
+			checked,
+		},
+	};
+}
+
+function externalImage(url: string, caption?: string): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "image",
+		image: {
+			type: "external",
+			external: { url },
+			...(caption
+				? { caption: [{ type: "text", text: { content: caption } }] }
+				: {}),
+		},
+	};
+}
+
+// Image block that references a Notion file upload by ID. Used for the
+// bundled heaven.gif and hell.gif assets that we upload at synthesis time.
+function uploadedImage(
+	fileUploadId: string,
+	caption?: string,
+): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "image",
+		image: {
+			type: "file_upload",
+			file_upload: { id: fileUploadId },
+			...(caption
+				? { caption: [{ type: "text", text: { content: caption } }] }
+				: {}),
+		},
+	};
+}
+
+// A resolved image reference for the forecast section. Either an external
+// URL (user-provided override) or a Notion file_upload_id (we uploaded
+// the bundled GIF at synthesis time).
+type ForecastImageRef =
+	| { kind: "external"; url: string }
+	| { kind: "file_upload"; id: string };
+
+type ForecastImages = {
+	mischievous: ForecastImageRef;
+	radiant: ForecastImageRef;
+};
+
+function forecastImageBlock(
+	ref: ForecastImageRef,
+	caption: string,
+): BlockObjectRequest {
+	if (ref.kind === "external") {
+		return externalImage(ref.url, caption);
+	}
+	return uploadedImage(ref.id, caption);
+}
+
+// Upload a local GIF asset (heaven.gif / hell.gif) to Notion and return
+// the resulting file_upload_id, which can then be referenced in image blocks.
+// Uses the SDK's two-step upload flow: create the upload object, then send
+// the file bytes as a single-part multipart payload.
+async function uploadForecastGif(
+	notion: Client,
+	filename: string,
+): Promise<string> {
+	const filePath = path.join(__dirname, "images", filename);
+	const data = await readFile(filePath);
+	const upload = await notion.fileUploads.create({
+		mode: "single_part",
+		filename,
+		content_type: "image/gif",
+	});
+	await notion.fileUploads.send({
+		file_upload_id: upload.id,
+		file: {
+			filename,
+			// Copy into a fresh ArrayBuffer-backed Uint8Array. fs.readFile
+			// returns a Buffer whose underlying buffer may be a shared pool,
+			// which doesn't satisfy DOM's strict BlobPart type.
+			data: new Blob([Uint8Array.from(data)], { type: "image/gif" }),
+		},
+	});
+	return upload.id;
+}
+
+// Resolve a forecast image: if the agent passed an override URL, use it as
+// an external image; otherwise upload the bundled default GIF and reference
+// it by file_upload_id. Falls back to the Doré URL if the upload fails so
+// the page still renders cleanly.
+async function resolveForecastImage(
+	notion: Client,
+	overrideUrl: string | null,
+	defaultGifFilename: string,
+	fallbackUrl: string,
+): Promise<ForecastImageRef> {
+	if (overrideUrl) {
+		return { kind: "external", url: overrideUrl };
+	}
+	try {
+		const id = await uploadForecastGif(notion, defaultGifFilename);
+		return { kind: "file_upload", id };
+	} catch (err) {
+		console.error(
+			`Failed to upload ${defaultGifFilename}, falling back to default URL:`,
+			err,
+		);
+		return { kind: "external", url: fallbackUrl };
+	}
+}
+
+function coloredCallout(
+	content: string,
+	emoji: string,
+	color: CalloutColor = "default",
+): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "callout",
+		callout: {
+			rich_text: [{ type: "text", text: { content } }],
+			icon: { type: "emoji", emoji: emoji as never },
+			color,
+		},
+	};
+}
+
+function columnList(columns: BlockObjectRequest[][]): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "column_list",
+		column_list: {
+			children: columns.map((children) => ({
+				object: "block" as const,
+				type: "column" as const,
+				column: { children },
+			})) as never,
+		},
+	};
+}
+
+// Toggleable heading — a section header that collapses its children. Lets
+// us land a tight hero above the fold and tuck long-form content behind
+// disclosure arrows so the page reads fast and rewards expansion.
+function toggleHeading2(
+	content: string,
+	children: BlockObjectRequest[],
+): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "heading_2",
+		heading_2: {
+			rich_text: [{ type: "text", text: { content } }],
+			is_toggleable: true,
+			children: children as never,
+		},
+	};
+}
+
+function toggleHeading3(
+	content: string,
+	children: BlockObjectRequest[],
+): BlockObjectRequest {
+	return {
+		object: "block",
+		type: "heading_3",
+		heading_3: {
+			rich_text: [{ type: "text", text: { content } }],
+			is_toggleable: true,
+			children: children as never,
+		},
+	};
+}
+
+function splitParagraphs(text: string): string[] {
+	return text
+		.split(/\n\s*\n/)
+		.map((p) => p.trim())
+		.filter((p) => p.length > 0);
+}
+
+// Hero block: the executive view of the forecast. Epigraph, snapshot,
+// mermaid fork diagram, and actionable to-dos. Stays above the fold.
+// No framing paragraphs, no CTA callouts — the content speaks for itself.
+function forecastHeroBlocks(forecast: Forecast): BlockObjectRequest[] {
+	const blocks: BlockObjectRequest[] = [];
+
+	// Optional dramatic epigraph — sets the tone above everything else.
+	if (forecast.dramaticEpigraph) {
+		blocks.push(
+			coloredCallout(forecast.dramaticEpigraph, "⚜️", "orange_background"),
+		);
+	}
+
+	// Snapshot — the shared factual preamble both readings work from.
+	blocks.push(coloredCallout(forecast.snapshot, "📍", "yellow_background"));
+
+	// Visual centerpiece: the forking trajectory rendered as a Mermaid diagram.
+	// Four milestones per path, color-coded red (hell) and blue (heaven) via
+	// classDef. Arrow emoji on each node reinforce the direction.
+	blocks.push(
+		mermaidDiagram(
+			[
+				"graph LR",
+				'  S["📍 Right now"]',
+				'  S --> F{"🔱 The Fork"}',
+				'  F -->|"Without intervention"| H1["⬇️ Weeks: friction"]',
+				'  H1 --> H2["⬇️ Months: drift"]',
+				'  H2 --> H3["⬇️ Quarter: haunted"]',
+				'  H3 --> H4["🔥 Year-end: The Inferno"]',
+				'  F -->|"With intervention"| A1["⬆️ Weeks: clarity"]',
+				'  A1 --> A2["⬆️ Months: cadence"]',
+				'  A2 --> A3["⬆️ Quarter: blessed"]',
+				'  A3 --> A4["✨ Year-end: Paradiso"]',
+				"  classDef hell fill:#fee2e2,stroke:#dc2626,color:#7f1d1d",
+				"  classDef heaven fill:#dbeafe,stroke:#2563eb,color:#1e3a8a",
+				"  class H1,H2,H3,H4 hell",
+				"  class A1,A2,A3,A4 heaven",
+			].join("\n"),
+		),
+	);
+
+	// Action heading + to-dos.
+	blocks.push(paragraphHeading("🔱 What to do right now", "heading_3"));
+	for (const item of forecast.fork) {
+		blocks.push(todo(`${item.action} — ${item.owner}, ${item.timing}`));
+	}
+
+	return blocks;
+}
+
+// Inner content for the Full Reading toggle section. Stacked vertically
+// because Notion's heading_2 toggle children do not accept column_list.
+// The GIFs + red/blue quote styling still carry the heaven/hell contrast.
+function forecastDeepInner(
+	forecast: Forecast,
+	forecastImages: ForecastImages | null,
+): BlockObjectRequest[] {
+	const mischievousImage: ForecastImageRef =
+		forecastImages?.mischievous ?? {
+			kind: "external",
+			url: forecast.mischievousImageUrl ?? DEFAULT_MISCHIEVOUS_IMAGE_URL,
+		};
+	const radiantImage: ForecastImageRef = forecastImages?.radiant ?? {
+		kind: "external",
+		url: forecast.radiantImageUrl ?? DEFAULT_RADIANT_IMAGE_URL,
+	};
+
+	return [
+		paragraphHeading("😈 The Mischievous Reading", "heading_3"),
+		forecastImageBlock(mischievousImage, "The Mischievous Reading"),
+		...splitParagraphs(forecast.mischievousReading).map((p) => quote(p, "red")),
+		paragraphHeading("😇 The Radiant Reading", "heading_3"),
+		forecastImageBlock(radiantImage, "The Radiant Reading"),
+		...splitParagraphs(forecast.radiantReading).map((p) => quote(p, "blue")),
+	];
 }
 
 async function fetchGranolaNote(
