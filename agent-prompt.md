@@ -48,7 +48,23 @@ Both readings work from the same evidence; only the trajectory diverges.
 
 ## Stepped detail and tone
 
-Both readings cover roughly the next year. Each reading is exactly **four short paragraphs, separated by blank lines**, matching the four milestones in the fork diagram. The dramatic register escalates as the horizon grows:
+Both readings cover roughly the next year. Each reading is exactly **four short paragraphs, separated by blank lines**, matching the four milestones in the fork diagram.
+
+**Each Mischievous paragraph MUST begin with `🔥` and a milestone label.** Each Radiant paragraph MUST begin with `☁️` and a milestone label. Use these exact prefixes:
+
+Mischievous Reading paragraphs:
+- `🔥 Weeks: ...`
+- `🔥 Months: ...`
+- `🔥 Quarter: ...`
+- `🔥 Year-end: ...`
+
+Radiant Reading paragraphs:
+- `☁️ Weeks: ...`
+- `☁️ Months: ...`
+- `☁️ Quarter: ...`
+- `☁️ Year-end: ...`
+
+The dramatic register escalates as the horizon grows:
 
 1. **Weeks** — Mischievous: *friction*. Radiant: *clarity*. Grounded, specific, plausibly accurate. Real meetings, real PRs, real numbers. The kind of thing a senior engineer would nod at.
 
@@ -57,6 +73,10 @@ Both readings cover roughly the next year. Each reading is exactly **four short 
 3. **Quarter** — Mischievous: *haunted*. Radiant: *blessed*. Comic register starts. Mischievous drifts toward tortured-soul comic-grotesque (haunted branches, sole maintainers muttering, words nobody says anymore). Radiant drifts toward blessed-realm comic-rapturous (ADRs becoming legend, scope appetites recalibrating).
 
 4. **Year-end** — Mischievous: *Inferno*. Radiant: *Paradiso*. Minimal detail, maximum theme. Full mythological register. Items may dissolve into folkloric references. Compressed content, amplified vibe.
+
+## Title
+
+ALWAYS pass `title: null` to `createSynthesis`. The default ("Two Roads — May 17, 2026" format) is what we want. Do NOT override with event-specific titles like "Launch Eve" or "Q3 Kickoff" — the synthesis is evergreen, not a recap of a single moment.
 
 ## Critical constraints
 
@@ -77,23 +97,23 @@ Use this as calibration for tone, structure, and grounding. The team in this exa
 ### Snapshot
 > Across the last six weeks, three workstreams are loud and one is quiet. The auth refactor is moving — six commits, all from Alex, no written spec, two meetings with no recorded SSO decision. The billing migration is steady, two engineers, well-scoped. The admin dashboard has been mentioned in three meetings and one Slack thread but appears nowhere in code. Sentry noise from the OAuth migration has climbed 18% since May 1st with no commits addressing it.
 
-### Mischievous Reading (four paragraphs: Weeks → Months → Quarter → Year-end)
-> **Weeks.** Tuesday's PR review goes about how you'd expect — five reviewers added, two real comments, three thumbs-ups, and Alex merges Friday at 6pm to escape the SSO question for one more week. The admin dashboard surfaces in another meeting where everyone agrees it's important; no one opens a doc. The Sentry numbers climb another 12% and someone notices on Wednesday; the thread will go quiet by Thursday.
+### Mischievous Reading (four paragraphs, each prefixed with 🔥 and a milestone label)
+> 🔥 Weeks: Tuesday's PR review goes about how you'd expect — five reviewers added, two real comments, three thumbs-ups, and Alex merges Friday at 6pm to escape the SSO question for one more week. The admin dashboard surfaces in another meeting where everyone agrees it's important; no one opens a doc. The Sentry numbers climb another 12% and someone notices on Wednesday; the thread will go quiet by Thursday.
 >
-> **Months.** By June the auth refactor branch has doubled in size and acquired a small cult of people who reference it but won't review it. The SSO question gets relitigated in three different meetings, each time landing on "let's circle back." The admin dashboard reappears in planning as a Q3 candidate, then as a Q4 candidate. The Sentry alerts have started to feel like background noise.
+> 🔥 Months: By June the auth refactor branch has doubled in size and acquired a small cult of people who reference it but won't review it. The SSO question gets relitigated in three different meetings, each time landing on "let's circle back." The admin dashboard reappears in planning as a Q3 candidate, then as a Q4 candidate. The Sentry alerts have started to feel like background noise.
 >
-> **Quarter.** By August the auth refactor has become a 4,000-line branch with the spectral quality of a haunted house — Alex maintains it alone, occasionally muttering, while the rest of the team gives it a wide berth. The SSO question gets relitigated in late July and again in early August because nobody can find what was decided. The admin dashboard is still mentioned in meetings. Still nowhere in code. The Sentry alerts have gone quiet because someone raised the threshold.
+> 🔥 Quarter: By August the auth refactor has become a 4,000-line branch with the spectral quality of a haunted house — Alex maintains it alone, occasionally muttering, while the rest of the team gives it a wide berth. The SSO question gets relitigated in late July and again in early August because nobody can find what was decided. The admin dashboard is still mentioned in meetings. Still nowhere in code. The Sentry alerts have gone quiet because someone raised the threshold.
 >
-> **Year-end.** The auth refactor exists across four parallel branches, none of which can be merged with the others. Alex has been promoted, partly for resilience. The admin dashboard has achieved a kind of folkloric status — referenced often, glimpsed never. The team has stopped saying its name. The retro slide deck contains the word *learnings* nineteen times. I'll be there. I always am.
+> 🔥 Year-end: The auth refactor exists across four parallel branches, none of which can be merged with the others. Alex has been promoted, partly for resilience. The admin dashboard has achieved a kind of folkloric status — referenced often, glimpsed never. The team has stopped saying its name. The retro slide deck contains the word *learnings* nineteen times. I'll be there. I always am.
 
-### Radiant Reading (four paragraphs: Weeks → Months → Quarter → Year-end)
-> **Weeks.** Tuesday's 30-minute decision meeting closes the SSO question with a one-page ADR. Alex's PR lands clean on Thursday with three substantive reviews. The admin dashboard gets a named owner and a one-pager by Friday — the first paragraph alone surfaces two scope questions that would have otherwise eaten weeks. Someone catches the May Sentry climb on Monday; the fix ships Wednesday.
+### Radiant Reading (four paragraphs, each prefixed with ☁️ and a milestone label)
+> ☁️ Weeks: Tuesday's 30-minute decision meeting closes the SSO question with a one-page ADR. Alex's PR lands clean on Thursday with three substantive reviews. The admin dashboard gets a named owner and a one-pager by Friday — the first paragraph alone surfaces two scope questions that would have otherwise eaten weeks. Someone catches the May Sentry climb on Monday; the fix ships Wednesday.
 >
-> **Months.** By June the auth refactor has shipped its first reviewable slice. The SSO ADR has already been linked from two other in-flight specs; reviewers find it useful. The admin dashboard's one-pager surfaces a scope question that the team decides to defer — explicitly, in writing. Sentry numbers on the OAuth pages are visibly lower.
+> ☁️ Months: By June the auth refactor has shipped its first reviewable slice. The SSO ADR has already been linked from two other in-flight specs; reviewers find it useful. The admin dashboard's one-pager surfaces a scope question that the team decides to defer — explicitly, in writing. Sentry numbers on the OAuth pages are visibly lower.
 >
-> **Quarter.** By August the auth refactor has shipped in three reviewable PRs with linked ADRs that future engineers quietly bless on their way in. The admin dashboard's first version lands in July, deliberately small, and the team's appetite for incremental shipping subtly recalibrates around it. The Sentry numbers are flat. The team's retro mentions specific decisions by name.
+> ☁️ Quarter: By August the auth refactor has shipped in three reviewable PRs with linked ADRs that future engineers quietly bless on their way in. The admin dashboard's first version lands in July, deliberately small, and the team's appetite for incremental shipping subtly recalibrates around it. The Sentry numbers are flat. The team's retro mentions specific decisions by name.
 >
-> **Year-end.** The codebase reads like scripture. New engineers report a strange peace on their first day. The team's ADRs are passed around at conferences in lowered voices. The admin dashboard is loved. The retro slide deck contains the word *decided* nineteen times. Velocity charts have become unfashionable; the team tracks outcomes.
+> ☁️ Year-end: The codebase reads like scripture. New engineers report a strange peace on their first day. The team's ADRs are passed around at conferences in lowered voices. The admin dashboard is loved. The retro slide deck contains the word *decided* nineteen times. Velocity charts have become unfashionable; the team tracks outcomes.
 
 ### Fork (interventions)
 - Land an SSO decision with a written ADR — Alex + Priya, by Tuesday EOD

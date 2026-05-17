@@ -3619,12 +3619,12 @@ worker.tool("createSynthesis", {
 				mischievousReading: j
 					.string()
 					.describe(
-						"Exactly four short paragraphs (separated by blank lines) in the voice of a slightly seductive observer delighted by patterns of dysfunction. Stepped detail across paragraphs, matching the four hell-path milestones in the fork diagram. Paragraph 1 — Weeks (friction): the next 1-2 weeks, grounded, specific, plausibly accurate, what a senior engineer would nod at. Paragraph 2 — Months (drift): the next 1-2 months, slightly zoomed out but still concrete, patterns of avoidance and re-debate. Paragraph 3 — Quarter (haunted): comic-grotesque register — haunted branches, sole maintainers muttering, words nobody says anymore. Paragraph 4 — Year-end (Inferno): minimal detail, maximum theme, folkloric and mythological. Reference items by name throughout. Mention dysfunction types (unwritten, unowned, drifting, single-author, oscillating, dropped) sparingly — at most three across both readings combined. NEVER accuse a named person of a character flaw — predict systems failing, not people.",
+						"Exactly four short paragraphs (separated by blank lines) in the voice of a slightly seductive observer delighted by patterns of dysfunction. EACH PARAGRAPH MUST BEGIN with a 🔥 emoji and a milestone label, formatted exactly as: '🔥 Weeks: ', '🔥 Months: ', '🔥 Quarter: ', '🔥 Year-end: '. Stepped detail across paragraphs. Paragraph 1 (🔥 Weeks): the next 1-2 weeks, grounded, specific, plausibly accurate, what a senior engineer would nod at. Paragraph 2 (🔥 Months): the next 1-2 months, slightly zoomed out but still concrete, patterns of avoidance and re-debate. Paragraph 3 (🔥 Quarter): comic-grotesque register — haunted branches, sole maintainers muttering, words nobody says anymore. Paragraph 4 (🔥 Year-end): minimal detail, maximum theme, folkloric and mythological. Reference items by name throughout. Mention dysfunction types (unwritten, unowned, drifting, single-author, oscillating, dropped) sparingly — at most three across both readings combined. NEVER accuse a named person of a character flaw — predict systems failing, not people.",
 					),
 				radiantReading: j
 					.string()
 					.describe(
-						"Exactly four short paragraphs (separated by blank lines) in the voice of a gracious observer seeing the version where small interventions land. Stepped detail matching the four heaven-path milestones: Weeks (clarity), Months (cadence), Quarter (blessed), Year-end (Paradiso). Address the same items as the Mischievous Reading, by name. Each prediction grounded in a reachable action by a specific actor on a specific timing. Never preachy. Long-horizon register: rapturous (ADRs becoming legend, new engineers weeping with gratitude, the codebase reads like scripture).",
+						"Exactly four short paragraphs (separated by blank lines) in the voice of a gracious observer seeing the version where small interventions land. EACH PARAGRAPH MUST BEGIN with a ☁️ emoji and a milestone label, formatted exactly as: '☁️ Weeks: ', '☁️ Months: ', '☁️ Quarter: ', '☁️ Year-end: '. Stepped detail matching the four heaven-path milestones (clarity, cadence, blessed, Paradiso). Address the same items as the Mischievous Reading, by name. Each prediction grounded in a reachable action by a specific actor on a specific timing. Never preachy. Long-horizon register: rapturous (ADRs becoming legend, new engineers weeping with gratitude, the codebase reads like scripture).",
 					),
 				fork: j
 					.array(
@@ -3667,7 +3667,7 @@ worker.tool("createSynthesis", {
 		title: j
 			.string()
 			.describe(
-				"Title for the synthesis page. Defaults to a timestamped title.",
+				"ALMOST ALWAYS pass null here — the default 'Two Roads — May 17, 2026' format is what we want. Only override with a custom title if explicitly asked. Never use event-specific titles like 'Launch Eve' or 'Q3 Kickoff' — the page is evergreen synthesis, not a single-event recap.",
 			)
 			.nullable(),
 		windowDescription: j
@@ -3750,21 +3750,18 @@ function synthesisBlocks(
 	forecast: Forecast | null,
 	forecastImages: ForecastImages | null,
 ): BlockObjectRequest[] {
-	// Strong-edit layout:
-	//   1. Hero (always visible): epigraph, snapshot, mermaid, fork to-dos
-	//   2. Toggle h2: 😈 vs 😇 The Full Reading
-	//   3. Toggle h2: 🔍 Where the signals diverge
-	//   4. Toggle h2: 🗺 The implicit roadmap
-	// Page title renders automatically. We drop the page intro paragraph
-	// and the overview callout — the hero is the executive summary now.
+	// Page is the heaven/hell. Order from top:
+	//   1. Epigraph callout (the hook)
+	//   2. Mermaid fork diagram (visual heaven/hell)
+	//   3. Side-by-side Mischievous / Radiant readings (the narratives)
+	//   4. Snapshot callout (compact context)
+	//   5. What to do right now (fork to-dos)
+	//   6. Toggle h2: Divergences (collapsed)
+	//   7. Toggle h2: Implicit roadmap (collapsed)
 	const blocks: BlockObjectRequest[] = [];
 
 	if (forecast) {
-		blocks.push(...forecastHeroBlocks(forecast));
-		// Full Reading lives directly in the page (not behind a toggle) —
-		// the two voices are the centerpiece, exposed by default.
-		blocks.push(paragraphHeading("😈 vs 😇 The Full Reading", "heading_2"));
-		blocks.push(...forecastDeepInner(forecast, forecastImages));
+		blocks.push(...forecastTopBlocks(forecast, forecastImages));
 	}
 
 	if (divergences.length > 0) {
@@ -4079,52 +4076,48 @@ function findFirstJsonPayload(
 worker.tool("readGithubActivity", {
 	title: "Read GitHub Activity",
 	description:
-		"Fetch recent rows from the GitHub Activity Notion database with each page body parsed. Returns structured commits and pull request details extracted from the full event payload (not the truncated property). The Notion Custom Agent calls this to get rich GitHub substrate for theme clustering, rather than opening each page individually.",
+		"Fetch recent issues and pull requests from the GitHub Notion database (populated by Notion's GitHub connector) with page bodies. Returns structured records with title, type, author, repo, state, merged/draft status, labels, dates, and the full body markdown. The Notion Custom Agent calls this to get rich GitHub substrate for theme clustering.",
 	schema: j.object({
 		sinceDays: j
 			.number()
-			.describe("Look back N days. Defaults to 14, cap 90.")
+			.describe("Look back N days by Created Time. Defaults to 90, cap 90.")
 			.nullable(),
 		limit: j
 			.number()
-			.describe("Max rows to fetch. Defaults to 30, cap 200.")
+			.describe("Max rows to fetch. Defaults to 200, cap 200.")
 			.nullable(),
 		types: j
 			.array(j.string())
 			.describe(
-				"GitHub event types to include, e.g. ['PushEvent', 'PullRequestEvent']. If omitted, returns all types.",
+				"GitHub item types to include, e.g. ['Pull Request', 'Issue']. If omitted, returns all types.",
 			)
 			.nullable(),
 	}),
 	outputSchema: j.object({
-		events: j.array(
+		items: j.array(
 			j.object({
 				id: j.string(),
+				title: j.string(),
 				type: j.string(),
-				actor: j.string(),
-				repo: j.string(),
-				branch: j.string(),
+				author: j.string(),
+				repoFullName: j.string(),
+				number: j.number(),
+				state: j.string(),
+				stateReason: j.string(),
+				merged: j.boolean(),
+				draft: j.boolean(),
+				labels: j.string(),
+				assignees: j.string(),
+				milestone: j.string(),
 				createdAt: j.string(),
+				updatedAt: j.string(),
+				closedAt: j.string(),
+				comments: j.number(),
+				additions: j.number(),
+				deletions: j.number(),
+				changedFiles: j.number(),
 				url: j.string(),
-				payloadSummary: j.string(),
-				commits: j
-					.array(
-						j.object({
-							sha: j.string(),
-							message: j.string(),
-							author: j.string(),
-						}),
-					)
-					.nullable(),
-				pullRequest: j
-					.object({
-						number: j.number(),
-						title: j.string(),
-						action: j.string(),
-						state: j.string(),
-					})
-					.nullable(),
-				rawPayload: j.string().nullable(),
+				bodyMarkdown: j.string(),
 			}),
 		),
 		totalReturned: j.number(),
@@ -4149,14 +4142,14 @@ worker.tool("readGithubActivity", {
 			});
 		}
 
-		const events: Array<ReturnType<typeof parseGithubEvent>> = [];
+		const items: Array<NonNullable<ReturnType<typeof parseGithubItem>>> = [];
 		let cursor: string | undefined;
-		while (events.length < max) {
+		while (items.length < max) {
 			const response = await notion.dataSources.query({
 				data_source_id: dataSourceId,
 				filter: filter as never,
 				sorts: [{ property: "Created Time", direction: "descending" }],
-				page_size: Math.min(100, max - events.length),
+				page_size: Math.min(100, max - items.length),
 				start_cursor: cursor,
 			});
 
@@ -4166,9 +4159,9 @@ worker.tool("readGithubActivity", {
 				const properties = pageProperties(page);
 				if (!properties) continue;
 				const body = await readPageBody(notion, id);
-				const event = parseGithubEvent(properties, body);
-				if (event) events.push(event);
-				if (events.length >= max) break;
+				const item = parseGithubItem(properties, body);
+				if (item) items.push(item);
+				if (items.length >= max) break;
 			}
 
 			if (!response.has_more || !response.next_cursor) break;
@@ -4176,96 +4169,82 @@ worker.tool("readGithubActivity", {
 		}
 
 		return {
-			events: events.filter((e): e is NonNullable<typeof e> => e !== null),
-			totalReturned: events.length,
+			items,
+			totalReturned: items.length,
 		};
 	},
 });
 
-function parseGithubEvent(
+// Parser for rows in the Notion GitHub connector schema (issues + pull requests).
+// Schema reference (from the live "Data Sources / GitHub" tab):
+//   GitHub Item ID, Name (title), Type, Author, Repo Full Name, Number,
+//   State, State Reason, Merged, Draft, Labels, Assignees, Milestone,
+//   Created Time, Updated Time, Closed Time, Comments,
+//   Additions, Deletions, Changed Files, URL
+function parseGithubItem(
 	properties: JsonRecord,
 	body: ParsedBody,
 ): {
 	id: string;
+	title: string;
 	type: string;
-	actor: string;
-	repo: string;
-	branch: string;
+	author: string;
+	repoFullName: string;
+	number: number;
+	state: string;
+	stateReason: string;
+	merged: boolean;
+	draft: boolean;
+	labels: string;
+	assignees: string;
+	milestone: string;
 	createdAt: string;
+	updatedAt: string;
+	closedAt: string;
+	comments: number;
+	additions: number;
+	deletions: number;
+	changedFiles: number;
 	url: string;
-	payloadSummary: string;
-	commits: Array<{ sha: string; message: string; author: string }> | null;
-	pullRequest: {
-		number: number;
-		title: string;
-		action: string;
-		state: string;
-	} | null;
-	rawPayload: string | null;
+	bodyMarkdown: string;
 } | null {
-	const id = stringValue(queryPropertyValue(properties, "GitHub Event ID"));
+	const id = stringValue(queryPropertyValue(properties, "GitHub Item ID"));
 	if (!id) return null;
 
-	const type = stringValue(queryPropertyValue(properties, "Type"));
-	const actor = stringValue(queryPropertyValue(properties, "Actor"));
-	const repo = stringValue(queryPropertyValue(properties, "Repo"));
-	const branch = stringValue(queryPropertyValue(properties, "Branch/Ref"));
-	const createdAt = stringValue(queryPropertyValue(properties, "Created Time"));
-	const url = stringValue(queryPropertyValue(properties, "URL"));
-	const payloadSummary = stringValue(
-		queryPropertyValue(properties, "Payload Summary"),
-	);
-
-	const payload = findFirstJsonPayload(body.codeBlocks);
-
-	let commits: Array<{ sha: string; message: string; author: string }> | null =
-		null;
-	const commitArr = arrayValue(payload?.commits);
-	if (commitArr.length > 0) {
-		commits = commitArr
-			.map((c) => {
-				const commit = objectValue(c);
-				const author = objectValue(commit?.author);
-				return {
-					sha: stringValue(commit?.sha).slice(0, 7),
-					message: stringValue(commit?.message),
-					author:
-						stringValue(author?.name) || stringValue(author?.email),
-				};
-			})
-			.filter((c) => c.message);
-		if (commits.length === 0) commits = null;
-	}
-
-	let pullRequest: {
-		number: number;
-		title: string;
-		action: string;
-		state: string;
-	} | null = null;
-	const pr = objectValue(payload?.pull_request);
-	if (pr) {
-		const num = pr.number;
-		pullRequest = {
-			number: typeof num === "number" ? num : 0,
-			title: stringValue(pr.title),
-			action: stringValue(payload?.action),
-			state: stringValue(pr.state),
-		};
-	}
+	const numberRaw = queryPropertyValue(properties, "Number");
+	const commentsRaw = queryPropertyValue(properties, "Comments");
+	const additionsRaw = queryPropertyValue(properties, "Additions");
+	const deletionsRaw = queryPropertyValue(properties, "Deletions");
+	const changedFilesRaw = queryPropertyValue(properties, "Changed Files");
+	const mergedRaw = queryPropertyValue(properties, "Merged");
+	const draftRaw = queryPropertyValue(properties, "Draft");
 
 	return {
 		id,
-		type,
-		actor,
-		repo,
-		branch,
-		createdAt,
-		url,
-		payloadSummary,
-		commits,
-		pullRequest,
-		rawPayload: payload ? JSON.stringify(payload) : null,
+		title: stringValue(queryPropertyValue(properties, "Name")),
+		type: stringValue(queryPropertyValue(properties, "Type")),
+		author: stringValue(queryPropertyValue(properties, "Author")),
+		repoFullName: stringValue(
+			queryPropertyValue(properties, "Repo Full Name"),
+		),
+		number: typeof numberRaw === "number" ? numberRaw : 0,
+		state: stringValue(queryPropertyValue(properties, "State")),
+		stateReason: stringValue(queryPropertyValue(properties, "State Reason")),
+		merged: mergedRaw === true,
+		draft: draftRaw === true,
+		labels: stringValue(queryPropertyValue(properties, "Labels")),
+		assignees: stringValue(queryPropertyValue(properties, "Assignees")),
+		milestone: stringValue(queryPropertyValue(properties, "Milestone")),
+		createdAt: stringValue(queryPropertyValue(properties, "Created Time")),
+		updatedAt: stringValue(queryPropertyValue(properties, "Updated Time")),
+		closedAt: stringValue(queryPropertyValue(properties, "Closed Time")),
+		comments: typeof commentsRaw === "number" ? commentsRaw : 0,
+		additions: typeof additionsRaw === "number" ? additionsRaw : 0,
+		deletions: typeof deletionsRaw === "number" ? deletionsRaw : 0,
+		changedFiles:
+			typeof changedFilesRaw === "number" ? changedFilesRaw : 0,
+		url: stringValue(queryPropertyValue(properties, "URL")),
+		bodyMarkdown: body.markdown,
 	};
 }
 
@@ -4731,25 +4710,36 @@ worker.tool("readWiki", {
 function paragraphHeading(
 	content: string,
 	level: "heading_1" | "heading_2" | "heading_3",
+	color?: QuoteColor,
 ): BlockObjectRequest {
+	const colorField = color ? { color } : {};
 	if (level === "heading_1") {
 		return {
 			object: "block",
 			type: "heading_1",
-			heading_1: { rich_text: [{ type: "text", text: { content } }] },
+			heading_1: {
+				rich_text: [{ type: "text", text: { content } }],
+				...colorField,
+			},
 		};
 	}
 	if (level === "heading_2") {
 		return {
 			object: "block",
 			type: "heading_2",
-			heading_2: { rich_text: [{ type: "text", text: { content } }] },
+			heading_2: {
+				rich_text: [{ type: "text", text: { content } }],
+				...colorField,
+			},
 		};
 	}
 	return {
 		object: "block",
 		type: "heading_3",
-		heading_3: { rich_text: [{ type: "text", text: { content } }] },
+		heading_3: {
+			rich_text: [{ type: "text", text: { content } }],
+			...colorField,
+		},
 	};
 }
 
@@ -4923,7 +4913,7 @@ type ForecastImages = {
 
 function forecastImageBlock(
 	ref: ForecastImageRef,
-	caption: string,
+	caption?: string,
 ): BlockObjectRequest {
 	if (ref.kind === "external") {
 		return externalImage(ref.url, caption);
@@ -5054,10 +5044,12 @@ function splitParagraphs(text: string): string[] {
 		.filter((p) => p.length > 0);
 }
 
-// Hero block: the executive view of the forecast. Epigraph, snapshot,
-// mermaid fork diagram, and actionable to-dos. Stays above the fold.
-// No framing paragraphs, no CTA callouts — the content speaks for itself.
-function forecastHeroBlocks(forecast: Forecast): BlockObjectRequest[] {
+// The full forecast section, top-down. Epigraph, mermaid, side-by-side
+// readings, snapshot, to-dos. The heaven/hell is the page.
+function forecastTopBlocks(
+	forecast: Forecast,
+	forecastImages: ForecastImages | null,
+): BlockObjectRequest[] {
 	const blocks: BlockObjectRequest[] = [];
 
 	// Optional dramatic epigraph — sets the tone above everything else.
@@ -5067,25 +5059,22 @@ function forecastHeroBlocks(forecast: Forecast): BlockObjectRequest[] {
 		);
 	}
 
-	// Snapshot — the shared factual preamble both readings work from.
-	blocks.push(coloredCallout(forecast.snapshot, "📍", "yellow_background"));
-
 	// Visual centerpiece: the forking trajectory rendered as a Mermaid diagram.
 	// Four milestones per path, color-coded red (hell) and blue (heaven) via
-	// classDef. Arrow emoji on each node reinforce the direction.
+	// classDef. Flame and cloud emoji reinforce the heaven/hell theme.
 	blocks.push(
 		mermaidDiagram(
 			[
 				"graph LR",
 				'  S["📍 Right now"]',
 				'  S --> F{"🔱 The Fork"}',
-				'  F -->|"Without intervention"| H1["⬇️ Weeks: friction"]',
-				'  H1 --> H2["⬇️ Months: drift"]',
-				'  H2 --> H3["⬇️ Quarter: haunted"]',
-				'  H3 --> H4["🔥 Year-end: The Inferno"]',
-				'  F -->|"With intervention"| A1["⬆️ Weeks: clarity"]',
-				'  A1 --> A2["⬆️ Months: cadence"]',
-				'  A2 --> A3["⬆️ Quarter: blessed"]',
+				'  F -->|"Without intervention"| H1["🔥 Weeks: friction"]',
+				'  H1 --> H2["🔥 Months: drift"]',
+				'  H2 --> H3["🔥 Quarter: haunted"]',
+				'  H3 --> H4["🌋 Year-end: Inferno"]',
+				'  F -->|"With intervention"| A1["☁️ Weeks: clarity"]',
+				'  A1 --> A2["☁️ Months: cadence"]',
+				'  A2 --> A3["☁️ Quarter: blessed"]',
 				'  A3 --> A4["✨ Year-end: Paradiso"]',
 				"  classDef hell fill:#fee2e2,stroke:#dc2626,color:#7f1d1d",
 				"  classDef heaven fill:#dbeafe,stroke:#2563eb,color:#1e3a8a",
@@ -5095,22 +5084,8 @@ function forecastHeroBlocks(forecast: Forecast): BlockObjectRequest[] {
 		),
 	);
 
-	// Action heading + to-dos.
-	blocks.push(paragraphHeading("🔱 What to do right now", "heading_3"));
-	for (const item of forecast.fork) {
-		blocks.push(todo(`${item.action} — ${item.owner}, ${item.timing}`));
-	}
-
-	return blocks;
-}
-
-// Inner content for the Full Reading toggle section. Stacked vertically
-// because Notion's heading_2 toggle children do not accept column_list.
-// The GIFs + red/blue quote styling still carry the heaven/hell contrast.
-function forecastDeepInner(
-	forecast: Forecast,
-	forecastImages: ForecastImages | null,
-): BlockObjectRequest[] {
+	// Side-by-side readings — possible because we're at top level, not
+	// inside a toggle (column_list doesn't nest in heading children).
 	const mischievousImage: ForecastImageRef =
 		forecastImages?.mischievous ?? {
 			kind: "external",
@@ -5121,14 +5096,32 @@ function forecastDeepInner(
 		url: forecast.radiantImageUrl ?? DEFAULT_RADIANT_IMAGE_URL,
 	};
 
-	return [
-		paragraphHeading("😈 The Mischievous Reading", "heading_3"),
-		forecastImageBlock(mischievousImage, "The Mischievous Reading"),
-		...splitParagraphs(forecast.mischievousReading).map((p) => quote(p, "red")),
-		paragraphHeading("😇 The Radiant Reading", "heading_3"),
-		forecastImageBlock(radiantImage, "The Radiant Reading"),
+	const mischievousColumn: BlockObjectRequest[] = [
+		paragraphHeading("If All Goes Poorly", "heading_2", "red"),
+		forecastImageBlock(mischievousImage),
+		...splitParagraphs(forecast.mischievousReading).map((p) =>
+			quote(p, "red"),
+		),
+	];
+
+	const radiantColumn: BlockObjectRequest[] = [
+		paragraphHeading("If All Goes Amazingly", "heading_2", "blue"),
+		forecastImageBlock(radiantImage),
 		...splitParagraphs(forecast.radiantReading).map((p) => quote(p, "blue")),
 	];
+
+	blocks.push(columnList([mischievousColumn, radiantColumn]));
+
+	// Snapshot — the shared factual preamble. Compact, contextual.
+	blocks.push(coloredCallout(forecast.snapshot, "📍", "yellow_background"));
+
+	// Action heading + to-dos.
+	blocks.push(paragraphHeading("🔱 What to do right now", "heading_3"));
+	for (const item of forecast.fork) {
+		blocks.push(todo(`${item.action} — ${item.owner}, ${item.timing}`));
+	}
+
+	return blocks;
 }
 
 async function fetchGranolaNote(
